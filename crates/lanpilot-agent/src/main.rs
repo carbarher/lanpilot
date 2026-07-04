@@ -2,11 +2,14 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
 use std::time::Duration;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use lanpilot_core::{
     ControlEvent, ControlFrame, DISCOVERY_PORT, DiscoveryProbe, DiscoveryResponse, EdgeDirection,
-    EdgeSwitchConfig, HandshakeAck, HandshakeHello, PRODUCT_NAME, PROTOCOL_MAGIC, StreamFrame,
-    StreamHello, TAGLINE, from_json_line, should_switch_to_remote, to_json_line,
+    EdgeSwitchConfig, HandshakeAck, HandshakeHello, PRODUCT_NAME, PROTOCOL_MAGIC,
+    StreamCompression, StreamFrame, StreamHello, TAGLINE, from_json_line, should_switch_to_remote,
+    to_json_line,
 };
+use lz4_flex::decompress_size_prepended;
 
 fn main() -> Result<(), String> {
     let agent_name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "lanpilot-agent".to_string());
@@ -166,6 +169,7 @@ fn run_phase3_stream_channel(
     let mut reader = BufReader::new(stream);
     let mut received = 0_u32;
     let mut last_sequence = 0_u64;
+    let mut total_raw = 0_usize;
     while received < 3 {
         let mut line = String::new();
         let bytes_read = reader
@@ -179,13 +183,32 @@ fn run_phase3_stream_channel(
         if frame.magic != PROTOCOL_MAGIC || frame.session_id != ack.session_id {
             return Err(format!("invalid stream frame payload: {:?}", frame));
         }
+        let raw_len = match frame.compression {
+            StreamCompression::None => frame.compressed_payload_b64.len(),
+            StreamCompression::Lz4 => {
+                let compressed = BASE64
+                    .decode(frame.compressed_payload_b64.as_bytes())
+                    .map_err(|err| format!("base64 decode failed: {err}"))?;
+                let raw = decompress_size_prepended(&compressed)
+                    .map_err(|err| format!("lz4 decompress failed: {err}"))?;
+                if frame.raw_len != 0 && raw.len() != frame.raw_len {
+                    return Err(format!(
+                        "raw length mismatch expected={} got={}",
+                        frame.raw_len,
+                        raw.len()
+                    ));
+                }
+                raw.len()
+            }
+        };
         received += 1;
         last_sequence = frame.sequence;
+        total_raw += raw_len;
     }
 
     println!(
-        "Phase 3: stream channel active, received {} synthetic frames (last sequence={})",
-        received, last_sequence
+        "Phase 4: stream channel active, received {} frames (last sequence={}, total raw bytes={})",
+        received, last_sequence, total_raw
     );
     Ok(())
 }

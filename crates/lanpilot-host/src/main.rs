@@ -1,13 +1,16 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use lanpilot_core::{
     CONTROL_PORT, ControlFrame, DISCOVERY_PORT, DiscoveryProbe, DiscoveryResponse, HANDSHAKE_PORT,
-    HandshakeAck, HandshakeHello, PRODUCT_NAME, PROTOCOL_MAGIC, STREAM_PORT, StreamFrame,
-    StreamHello, TAGLINE, from_json_line, local_ipv4, to_json_line,
+    HandshakeAck, HandshakeHello, PRODUCT_NAME, PROTOCOL_MAGIC, STREAM_PORT, StreamCompression,
+    StreamFrame, StreamHello, TAGLINE, from_json_line, local_ipv4, to_json_line, unix_timestamp_ms,
 };
+use lz4_flex::compress_prepend_size;
+use scrap::{Capturer, Display};
 
 fn main() {
     let host_name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "lanpilot-host".to_string());
@@ -201,8 +204,23 @@ fn handle_stream_channel(mut stream: TcpStream) -> Result<(), String> {
         hello.session_id, hello.agent_name, peer
     );
 
-    for sequence in 0..5_u64 {
-        let frame = StreamFrame::synthetic(hello.session_id.clone(), sequence);
+    let frame_interval_ms = 100_u32;
+    let source_mode =
+        std::env::var("LANPILOT_STREAM_SOURCE").unwrap_or_else(|_| "screen".to_string());
+    let mut capture = if source_mode.eq_ignore_ascii_case("synthetic") {
+        None
+    } else {
+        Some(ScreenCapture::new()?)
+    };
+
+    for sequence in 0..30_u64 {
+        let tick_start = Instant::now();
+        let frame = match capture.as_mut() {
+            Some(screen) => {
+                screen.capture_frame(hello.session_id.clone(), sequence, frame_interval_ms)?
+            }
+            None => StreamFrame::synthetic(hello.session_id.clone(), sequence),
+        };
         let encoded =
             to_json_line(&frame).map_err(|err| format!("encode stream frame failed: {err}"))?;
         if let Err(err) = stream.write_all(encoded.as_bytes()) {
@@ -216,10 +234,74 @@ fn handle_stream_channel(mut stream: TcpStream) -> Result<(), String> {
             }
             return Err(format!("send stream frame failed: {err}"));
         }
-        thread::sleep(Duration::from_millis(120));
+        let elapsed = tick_start.elapsed();
+        let target = Duration::from_millis(frame_interval_ms as u64);
+        if elapsed < target {
+            thread::sleep(target - elapsed);
+        }
     }
 
     Ok(())
+}
+
+struct ScreenCapture {
+    capturer: Capturer,
+    width: u32,
+    height: u32,
+}
+
+impl ScreenCapture {
+    fn new() -> Result<Self, String> {
+        let display = Display::primary().map_err(|err| format!("primary display error: {err}"))?;
+        let width = display.width() as u32;
+        let height = display.height() as u32;
+        let capturer =
+            Capturer::new(display).map_err(|err| format!("capturer init error: {err}"))?;
+        Ok(Self {
+            capturer,
+            width,
+            height,
+        })
+    }
+
+    fn capture_frame(
+        &mut self,
+        session_id: String,
+        sequence: u64,
+        frame_interval_ms: u32,
+    ) -> Result<StreamFrame, String> {
+        let mut attempts = 0;
+        let bytes = loop {
+            match self.capturer.frame() {
+                Ok(frame) => break frame.to_vec(),
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    attempts += 1;
+                    if attempts > 25 {
+                        return Err("screen capture timeout waiting for frame".to_string());
+                    }
+                    thread::sleep(Duration::from_millis(4));
+                }
+                Err(err) => return Err(format!("screen capture error: {err}")),
+            }
+        };
+
+        let compressed = compress_prepend_size(&bytes);
+        let encoded = BASE64.encode(compressed);
+        Ok(StreamFrame {
+            magic: PROTOCOL_MAGIC.to_string(),
+            session_id,
+            sequence,
+            captured_at_ms: unix_timestamp_ms(),
+            width: self.width,
+            height: self.height,
+            pixel_format: "bgra8".to_string(),
+            compression: StreamCompression::Lz4,
+            frame_interval_ms,
+            compressed_payload_b64: encoded,
+            raw_len: bytes.len(),
+            source: "screen".to_string(),
+        })
+    }
 }
 
 fn handle_handshake(mut stream: TcpStream, host_name: &str) -> Result<(), String> {

@@ -194,22 +194,40 @@ pub struct StreamFrame {
     pub magic: String,
     pub session_id: String,
     pub sequence: u64,
+    pub captured_at_ms: u128,
     pub width: u32,
     pub height: u32,
     pub pixel_format: String,
-    pub payload_hint: String,
+    pub compression: StreamCompression,
+    pub frame_interval_ms: u32,
+    pub compressed_payload_b64: String,
+    pub raw_len: usize,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamCompression {
+    None,
+    Lz4,
 }
 
 impl StreamFrame {
     pub fn synthetic(session_id: impl Into<String>, sequence: u64) -> Self {
+        let payload = format!("synthetic-frame-{sequence}");
         Self {
             magic: PROTOCOL_MAGIC.to_string(),
             session_id: session_id.into(),
             sequence,
+            captured_at_ms: unix_timestamp_ms(),
             width: 1280,
             height: 720,
             pixel_format: "rgba8".to_string(),
-            payload_hint: format!("synthetic-frame-{sequence}"),
+            compression: StreamCompression::None,
+            frame_interval_ms: 100,
+            compressed_payload_b64: payload,
+            raw_len: 0,
+            source: "synthetic".to_string(),
         }
     }
 }
@@ -235,11 +253,15 @@ pub fn local_ipv4() -> Option<Ipv4Addr> {
 }
 
 fn generate_session_id() -> String {
-    let millis = SystemTime::now()
+    let millis = unix_timestamp_ms();
+    format!("lp-{millis}")
+}
+
+pub fn unix_timestamp_ms() -> u128 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
-        .unwrap_or_default();
-    format!("lp-{millis}")
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -317,5 +339,14 @@ mod tests {
         let line = to_json_line(&frame).expect("must serialize stream frame");
         let decoded: StreamFrame = from_json_line(&line).expect("must deserialize stream frame");
         assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn stream_frame_synthetic_fields_are_stable() {
+        let frame = StreamFrame::synthetic("lp-xyz", 1);
+        assert_eq!(frame.compression, StreamCompression::None);
+        assert_eq!(frame.source, "synthetic");
+        assert_eq!(frame.frame_interval_ms, 100);
+        assert!(frame.compressed_payload_b64.starts_with("synthetic-frame-"));
     }
 }

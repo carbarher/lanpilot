@@ -55,3 +55,17 @@ After Phase 2:
 - agent opens stream channel on TCP (`47045`)
 - agent sends `StreamHello` with current session id
 - host streams synthetic frames (`StreamFrame`) to validate capture/transport flow
+
+### Phase 4 MVP: real capture + compression + frame timing
+
+- host captures real desktop frames with `scrap` (default mode)
+- host compresses frames with LZ4 and sends base64 payloads in `StreamFrame`
+- host applies frame pacing (`frame_interval_ms`, target ~10 FPS)
+- agent validates and decompresses incoming frames
+
+Optional fallback for environments without desktop capture:
+
+```powershell
+$env:LANPILOT_STREAM_SOURCE = "synthetic"
+cargo run -p lanpilot-host
+```
