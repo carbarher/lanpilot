@@ -18,6 +18,24 @@ LanPilot is a LAN-first remote desktop control project designed to pair naturall
 ```powershell
 cargo build
 cargo test
+```
+
+### Phase 1 MVP: discovery + handshake
+
+Start host (terminal 1):
+
+```powershell
 cargo run -p lanpilot-host
+```
+
+Run agent (terminal 2, same LAN):
+
+```powershell
 cargo run -p lanpilot-agent
 ```
+
+Expected behavior:
+
+- agent broadcasts discovery over UDP (`47042`)
+- host responds with identity + handshake endpoint
+- agent opens TCP handshake (`47043`) and receives session ack
