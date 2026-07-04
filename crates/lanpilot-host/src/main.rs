@@ -168,6 +168,8 @@ fn handle_control_stream(stream: TcpStream, tuning: Arc<Mutex<StreamTuning>>, se
     };
 
     // Timeout prevents a slow/stalled sender from blocking this thread forever.
+    // We treat TimedOut as a no-op (keep-alive silence) rather than a disconnect —
+    // the agent may simply not have sent feedback yet (stable conditions).
     if let Err(err) = stream.set_read_timeout(Some(Duration::from_secs(30))) {
         eprintln!("control set_read_timeout error from {peer}: {err}");
         return;
@@ -178,6 +180,13 @@ fn handle_control_stream(stream: TcpStream, tuning: Arc<Mutex<StreamTuning>>, se
         let mut line = String::new();
         let bytes_read = match reader.read_line(&mut line) {
             Ok(read) => read,
+            Err(err)
+                if err.kind() == std::io::ErrorKind::TimedOut
+                    || err.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                // Silence on the control channel is normal during stable streaming.
+                continue;
+            }
             Err(err) => {
                 eprintln!("control read error from {peer}: {err}");
                 break;
@@ -283,6 +292,10 @@ fn handle_stream_channel(
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|err| format!("stream set_read_timeout error: {err}"))?;
+    // Write timeout prevents a stalled agent from blocking this thread forever.
+    stream
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .map_err(|err| format!("stream set_write_timeout error: {err}"))?;
     let mut reader = BufReader::new(
         stream
             .try_clone()
@@ -372,6 +385,11 @@ fn handle_stream_channel(
         if elapsed < target {
             thread::sleep(target - elapsed);
         }
+    }
+
+    // Evict the session so stale IDs can't be replayed after this channel closes.
+    if let Ok(mut guard) = sessions.lock() {
+        guard.remove(&hello.session_id);
     }
 
     Ok(())

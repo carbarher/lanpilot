@@ -216,6 +216,9 @@ fn run_phase3_stream_channel(
     let control_endpoint = format!("{}:{}", host_ipv4, ack.control_port);
     let mut control_stream = TcpStream::connect(control_endpoint.as_str())
         .map_err(|err| format!("connect persistent control socket failed: {err}"))?;
+    control_stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .map_err(|err| format!("set control write timeout failed: {err}"))?;
 
     let mut received = 0_u32;
     let mut last_sequence = 0_u64;
@@ -224,9 +227,17 @@ fn run_phase3_stream_channel(
 
     while received < target_frames {
         let mut line = String::new();
-        let bytes_read = reader
-            .read_line(&mut line)
-            .map_err(|err| format!("read stream frame failed: {err}"))?;
+        let bytes_read = match reader.read_line(&mut line) {
+            Ok(n) => n,
+            Err(err)
+                if err.kind() == std::io::ErrorKind::TimedOut
+                    || err.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                // Host is slow to produce a frame — just retry.
+                continue;
+            }
+            Err(err) => return Err(format!("read stream frame failed: {err}")),
+        };
         if bytes_read == 0 {
             break;
         }
