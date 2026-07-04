@@ -74,6 +74,14 @@ $env:LANPILOT_RENDER = "0"
 cargo run -p lanpilot-agent
 ```
 
+### Phase 6 MVP: adaptive bitrate/FPS
+
+- agent sends runtime `StreamFeedback` over control channel
+- host adapts stream settings in-flight:
+  - `target_fps` (frame pacing)
+  - `scale_divisor` (effective stream bitrate/size)
+- adaptation decisions are based on observed latency/jitter windows
+
 Optional fallback for environments without desktop capture:
 
 ```powershell

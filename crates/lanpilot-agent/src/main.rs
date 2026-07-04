@@ -178,6 +178,7 @@ fn run_phase3_stream_channel(
     let mut received = 0_u32;
     let mut last_sequence = 0_u64;
     let mut total_raw = 0_usize;
+    let mut last_feedback: Option<(u32, u8)> = None;
 
     while received < target_frames {
         let mut line = String::new();
@@ -205,6 +206,16 @@ fn run_phase3_stream_channel(
         last_sequence = frame.sequence;
         total_raw += raw.len();
         metrics.observe(frame.captured_at_ms);
+
+        if received % 10 == 0 {
+            let summary = metrics.summary();
+            let (target_fps, scale_divisor) = choose_adaptive_target(&summary);
+            let next_feedback = (target_fps, scale_divisor);
+            if last_feedback != Some(next_feedback) {
+                send_stream_feedback(host_ipv4, ack, &summary, target_fps, scale_divisor)?;
+                last_feedback = Some(next_feedback);
+            }
+        }
     }
 
     let summary = metrics.summary();
@@ -212,6 +223,45 @@ fn run_phase3_stream_channel(
         "Phase 5: stream/render active, frames={} last_seq={} raw={} fps={:.2} avg_latency_ms={:.2} jitter_ms={:.2}",
         received, last_sequence, total_raw, summary.fps, summary.avg_latency_ms, summary.jitter_ms
     );
+    Ok(())
+}
+
+fn choose_adaptive_target(summary: &StreamSummary) -> (u32, u8) {
+    if summary.avg_latency_ms > 240.0 || summary.jitter_ms > 150.0 {
+        (5, 3)
+    } else if summary.avg_latency_ms > 170.0 || summary.jitter_ms > 100.0 {
+        (7, 2)
+    } else if summary.avg_latency_ms > 120.0 || summary.jitter_ms > 70.0 {
+        (9, 2)
+    } else {
+        (12, 1)
+    }
+}
+
+fn send_stream_feedback(
+    host_ipv4: &str,
+    ack: &HandshakeAck,
+    summary: &StreamSummary,
+    target_fps: u32,
+    scale_divisor: u8,
+) -> Result<(), String> {
+    let feedback = ControlFrame::new(
+        ack.session_id.clone(),
+        vec![ControlEvent::StreamFeedback {
+            target_fps,
+            scale_divisor,
+            avg_latency_ms: summary.avg_latency_ms.round() as u32,
+            jitter_ms: summary.jitter_ms.round() as u32,
+        }],
+    );
+    let endpoint = format!("{}:{}", host_ipv4, ack.control_port);
+    let mut stream = TcpStream::connect(endpoint.as_str())
+        .map_err(|err| format!("connect feedback socket failed: {err}"))?;
+    let encoded =
+        to_json_line(&feedback).map_err(|err| format!("encode feedback frame failed: {err}"))?;
+    stream
+        .write_all(encoded.as_bytes())
+        .map_err(|err| format!("send feedback frame failed: {err}"))?;
     Ok(())
 }
 

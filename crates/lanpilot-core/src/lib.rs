@@ -151,6 +151,12 @@ pub enum ControlEvent {
         key: String,
         pressed: bool,
     },
+    StreamFeedback {
+        target_fps: u32,
+        scale_divisor: u8,
+        avg_latency_ms: u32,
+        jitter_ms: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -328,6 +334,12 @@ mod tests {
                 ControlEvent::MouseButton {
                     button: "left".to_string(),
                     pressed: true,
+                },
+                ControlEvent::StreamFeedback {
+                    target_fps: 8,
+                    scale_divisor: 2,
+                    avg_latency_ms: 190,
+                    jitter_ms: 85,
                 },
             ],
         );

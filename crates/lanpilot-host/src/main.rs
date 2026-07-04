@@ -1,16 +1,33 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use lanpilot_core::{
-    CONTROL_PORT, ControlFrame, DISCOVERY_PORT, DiscoveryProbe, DiscoveryResponse, HANDSHAKE_PORT,
-    HandshakeAck, HandshakeHello, PRODUCT_NAME, PROTOCOL_MAGIC, STREAM_PORT, StreamCompression,
-    StreamFrame, StreamHello, TAGLINE, from_json_line, local_ipv4, to_json_line, unix_timestamp_ms,
+    CONTROL_PORT, ControlEvent, ControlFrame, DISCOVERY_PORT, DiscoveryProbe, DiscoveryResponse,
+    HANDSHAKE_PORT, HandshakeAck, HandshakeHello, PRODUCT_NAME, PROTOCOL_MAGIC, STREAM_PORT,
+    StreamCompression, StreamFrame, StreamHello, TAGLINE, from_json_line, local_ipv4, to_json_line,
+    unix_timestamp_ms,
 };
 use lz4_flex::compress_prepend_size;
 use scrap::{Capturer, Display};
+
+#[derive(Clone, Copy, Debug)]
+struct StreamTuning {
+    target_fps: u32,
+    scale_divisor: u8,
+}
+
+impl Default for StreamTuning {
+    fn default() -> Self {
+        Self {
+            target_fps: 10,
+            scale_divisor: 1,
+        }
+    }
+}
 
 fn main() {
     let host_name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "lanpilot-host".to_string());
@@ -28,8 +45,11 @@ fn main() {
     let discovery_ip = host_ipv4;
     let _discovery_thread =
         thread::spawn(move || run_discovery_server(&discovery_name, discovery_ip));
-    let _control_thread = thread::spawn(run_control_server);
-    let _stream_thread = thread::spawn(run_stream_server);
+    let tuning = Arc::new(Mutex::new(StreamTuning::default()));
+    let control_tuning = Arc::clone(&tuning);
+    let stream_tuning = Arc::clone(&tuning);
+    let _control_thread = thread::spawn(move || run_control_server(control_tuning));
+    let _stream_thread = thread::spawn(move || run_stream_server(stream_tuning));
 
     run_handshake_server(&host_name);
 }
@@ -103,21 +123,22 @@ fn run_handshake_server(host_name: &str) {
     }
 }
 
-fn run_control_server() {
+fn run_control_server(tuning: Arc<Mutex<StreamTuning>>) {
     let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, CONTROL_PORT))
         .expect("failed to bind TCP control listener");
 
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                thread::spawn(move || handle_control_stream(stream));
+                let tuning = Arc::clone(&tuning);
+                thread::spawn(move || handle_control_stream(stream, tuning));
             }
             Err(err) => eprintln!("control incoming connection error: {err}"),
         }
     }
 }
 
-fn handle_control_stream(stream: TcpStream) {
+fn handle_control_stream(stream: TcpStream, tuning: Arc<Mutex<StreamTuning>>) {
     let peer = match stream.peer_addr() {
         Ok(addr) => addr.to_string(),
         Err(err) => {
@@ -158,18 +179,51 @@ fn handle_control_stream(stream: TcpStream) {
             frame.session_id,
             frame.events.len()
         );
+        for event in &frame.events {
+            if let ControlEvent::StreamFeedback {
+                target_fps,
+                scale_divisor,
+                avg_latency_ms,
+                jitter_ms,
+            } = event
+            {
+                let mut guard = match tuning.lock() {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        eprintln!("failed to lock stream tuning");
+                        continue;
+                    }
+                };
+                let next_fps = (*target_fps).clamp(3, 30);
+                let next_scale = (*scale_divisor).clamp(1, 3);
+                if guard.target_fps != next_fps || guard.scale_divisor != next_scale {
+                    println!(
+                        "Adaptive stream update: fps {}->{} scale {}->{} (lat={}ms jitter={}ms)",
+                        guard.target_fps,
+                        next_fps,
+                        guard.scale_divisor,
+                        next_scale,
+                        avg_latency_ms,
+                        jitter_ms
+                    );
+                    guard.target_fps = next_fps;
+                    guard.scale_divisor = next_scale;
+                }
+            }
+        }
     }
 }
 
-fn run_stream_server() {
+fn run_stream_server(tuning: Arc<Mutex<StreamTuning>>) {
     let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, STREAM_PORT))
         .expect("failed to bind TCP stream listener");
 
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
+                let tuning = Arc::clone(&tuning);
                 thread::spawn(move || {
-                    if let Err(err) = handle_stream_channel(stream) {
+                    if let Err(err) = handle_stream_channel(stream, tuning) {
                         eprintln!("stream channel error: {err}");
                     }
                 });
@@ -179,7 +233,10 @@ fn run_stream_server() {
     }
 }
 
-fn handle_stream_channel(mut stream: TcpStream) -> Result<(), String> {
+fn handle_stream_channel(
+    mut stream: TcpStream,
+    tuning: Arc<Mutex<StreamTuning>>,
+) -> Result<(), String> {
     let peer = stream
         .peer_addr()
         .map_err(|err| format!("stream peer addr error: {err}"))?;
@@ -204,7 +261,6 @@ fn handle_stream_channel(mut stream: TcpStream) -> Result<(), String> {
         hello.session_id, hello.agent_name, peer
     );
 
-    let frame_interval_ms = 100_u32;
     let source_mode =
         std::env::var("LANPILOT_STREAM_SOURCE").unwrap_or_else(|_| "screen".to_string());
     let mut capture = if source_mode.eq_ignore_ascii_case("synthetic") {
@@ -219,13 +275,31 @@ fn handle_stream_channel(mut stream: TcpStream) -> Result<(), String> {
         }
     };
 
-    for sequence in 0..30_u64 {
+    let max_frames = std::env::var("LANPILOT_MAX_STREAM_FRAMES")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(120);
+
+    for sequence in 0..max_frames {
         let tick_start = Instant::now();
+        let tuning_snapshot = match tuning.lock() {
+            Ok(guard) => *guard,
+            Err(_) => StreamTuning::default(),
+        };
+        let frame_interval_ms = (1000 / tuning_snapshot.target_fps.max(1)).max(16);
         let frame = match capture.as_mut() {
-            Some(screen) => {
-                screen.capture_frame(hello.session_id.clone(), sequence, frame_interval_ms)?
-            }
-            None => StreamFrame::synthetic(hello.session_id.clone(), sequence),
+            Some(screen) => screen.capture_frame(
+                hello.session_id.clone(),
+                sequence,
+                frame_interval_ms,
+                tuning_snapshot.scale_divisor,
+            )?,
+            None => synthetic_frame_with_tuning(
+                hello.session_id.clone(),
+                sequence,
+                frame_interval_ms,
+                tuning_snapshot.scale_divisor,
+            ),
         };
         let encoded =
             to_json_line(&frame).map_err(|err| format!("encode stream frame failed: {err}"))?;
@@ -275,6 +349,7 @@ impl ScreenCapture {
         session_id: String,
         sequence: u64,
         frame_interval_ms: u32,
+        scale_divisor: u8,
     ) -> Result<StreamFrame, String> {
         let mut attempts = 0;
         let bytes = loop {
@@ -292,24 +367,70 @@ impl ScreenCapture {
         };
 
         let stride_bytes = bytes.len() / self.height as usize;
-        let compressed = compress_prepend_size(&bytes);
+        let (scaled, width, height, scaled_stride) =
+            normalize_and_scale_bgra(&bytes, self.width, self.height, stride_bytes, scale_divisor);
+        let compressed = compress_prepend_size(&scaled);
         let encoded = BASE64.encode(compressed);
         Ok(StreamFrame {
             magic: PROTOCOL_MAGIC.to_string(),
             session_id,
             sequence,
             captured_at_ms: unix_timestamp_ms(),
-            width: self.width,
-            height: self.height,
-            stride_bytes,
+            width,
+            height,
+            stride_bytes: scaled_stride,
             pixel_format: "bgra8".to_string(),
             compression: StreamCompression::Lz4,
             frame_interval_ms,
             compressed_payload_b64: encoded,
-            raw_len: bytes.len(),
+            raw_len: scaled.len(),
             source: "screen".to_string(),
         })
     }
+}
+
+fn synthetic_frame_with_tuning(
+    session_id: String,
+    sequence: u64,
+    frame_interval_ms: u32,
+    scale_divisor: u8,
+) -> StreamFrame {
+    let divisor = scale_divisor.clamp(1, 3) as u32;
+    let mut frame = StreamFrame::synthetic(session_id, sequence);
+    frame.width = (frame.width / divisor).max(1);
+    frame.height = (frame.height / divisor).max(1);
+    frame.stride_bytes = frame.width as usize * 4;
+    frame.raw_len = frame.stride_bytes * frame.height as usize;
+    frame.frame_interval_ms = frame_interval_ms;
+    frame
+}
+
+fn normalize_and_scale_bgra(
+    input: &[u8],
+    width: u32,
+    height: u32,
+    input_stride: usize,
+    scale_divisor: u8,
+) -> (Vec<u8>, u32, u32, usize) {
+    let divisor = scale_divisor.clamp(1, 3) as usize;
+    let out_width = (width as usize / divisor).max(1);
+    let out_height = (height as usize / divisor).max(1);
+    let out_stride = out_width * 4;
+    let mut out = vec![0_u8; out_height * out_stride];
+
+    for y in 0..out_height {
+        let src_y = (y * divisor).min(height as usize - 1);
+        let src_row = src_y * input_stride;
+        let dst_row = y * out_stride;
+        for x in 0..out_width {
+            let src_x = (x * divisor).min(width as usize - 1);
+            let src_idx = src_row + src_x * 4;
+            let dst_idx = dst_row + x * 4;
+            out[dst_idx..dst_idx + 4].copy_from_slice(&input[src_idx..src_idx + 4]);
+        }
+    }
+
+    (out, out_width as u32, out_height as u32, out_stride)
 }
 
 fn handle_handshake(mut stream: TcpStream, host_name: &str) -> Result<(), String> {
