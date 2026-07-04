@@ -73,6 +73,18 @@ fn discover_host(agent_name: &str, pair_code: &str) -> Result<DiscoveryResponse,
         ));
     }
 
+    // Reject forged responses: the IP in the payload must match the packet source.
+    let claimed_ip = response
+        .host_ipv4
+        .parse::<std::net::IpAddr>()
+        .map_err(|err| format!("invalid host_ipv4 in discovery response: {err}"))?;
+    if source.ip() != claimed_ip {
+        return Err(format!(
+            "discovery response IP mismatch: payload claims {claimed_ip} but packet arrived from {}",
+            source.ip()
+        ));
+    }
+
     Ok(response)
 }
 
@@ -200,6 +212,11 @@ fn run_phase3_stream_channel(
         .and_then(|raw| raw.parse::<u32>().ok())
         .unwrap_or(60);
 
+    // Open persistent control connection once for the session lifetime.
+    let control_endpoint = format!("{}:{}", host_ipv4, ack.control_port);
+    let mut control_stream = TcpStream::connect(control_endpoint.as_str())
+        .map_err(|err| format!("connect persistent control socket failed: {err}"))?;
+
     let mut received = 0_u32;
     let mut last_sequence = 0_u64;
     let mut total_raw = 0_usize;
@@ -230,14 +247,14 @@ fn run_phase3_stream_channel(
         received += 1;
         last_sequence = frame.sequence;
         total_raw += raw.len();
-        metrics.observe(frame.captured_at_ms);
+        metrics.observe(frame.captured_at_ms, frame.frame_interval_ms);
 
         if received % 10 == 0 {
             let summary = metrics.summary();
             let (target_fps, scale_divisor) = choose_adaptive_target(&summary);
             let next_feedback = (target_fps, scale_divisor);
             if last_feedback != Some(next_feedback) {
-                send_stream_feedback(host_ipv4, ack, &summary, target_fps, scale_divisor)?;
+                send_stream_feedback(&mut control_stream, ack, &summary, target_fps, scale_divisor)?;
                 last_feedback = Some(next_feedback);
             }
         }
@@ -264,7 +281,7 @@ fn choose_adaptive_target(summary: &StreamSummary) -> (u32, u8) {
 }
 
 fn send_stream_feedback(
-    host_ipv4: &str,
+    control: &mut TcpStream,
     ack: &HandshakeAck,
     summary: &StreamSummary,
     target_fps: u32,
@@ -279,12 +296,9 @@ fn send_stream_feedback(
             jitter_ms: summary.jitter_ms.round() as u32,
         }],
     );
-    let endpoint = format!("{}:{}", host_ipv4, ack.control_port);
-    let mut stream = TcpStream::connect(endpoint.as_str())
-        .map_err(|err| format!("connect feedback socket failed: {err}"))?;
     let encoded =
         to_json_line(&feedback).map_err(|err| format!("encode feedback frame failed: {err}"))?;
-    stream
+    control
         .write_all(encoded.as_bytes())
         .map_err(|err| format!("send feedback frame failed: {err}"))?;
     Ok(())
@@ -292,7 +306,17 @@ fn send_stream_feedback(
 
 fn decode_stream_frame(frame: &StreamFrame) -> Result<Vec<u8>, String> {
     match frame.compression {
-        StreamCompression::None => Ok(generate_synthetic_bgra(frame)),
+        StreamCompression::None => {
+            if frame.compressed_payload_b64.is_empty() {
+                // Synthetic frame — generate animated test pattern.
+                Ok(generate_synthetic_bgra(frame))
+            } else {
+                // Uncompressed real frame — just base64-decode the payload.
+                BASE64
+                    .decode(frame.compressed_payload_b64.as_bytes())
+                    .map_err(|err| format!("base64 decode (uncompressed) failed: {err}"))
+            }
+        }
         StreamCompression::Lz4 => {
             let compressed = BASE64
                 .decode(frame.compressed_payload_b64.as_bytes())
@@ -430,7 +454,7 @@ impl StreamMetrics {
         }
     }
 
-    fn observe(&mut self, captured_at_ms: u128) {
+    fn observe(&mut self, captured_at_ms: u128, frame_interval_ms: u32) {
         let now = Instant::now();
         self.frame_count += 1;
 
@@ -442,7 +466,7 @@ impl StreamMetrics {
 
         if let Some(previous) = self.previous_arrival {
             let interval_ms = (now - previous).as_secs_f64() * 1000.0;
-            let expected_ms = 100.0;
+            let expected_ms = frame_interval_ms as f64;
             let deviation = (interval_ms - expected_ms).abs();
             self.jitter_ms = (self.jitter_ms * 0.85) + (deviation * 0.15);
         }

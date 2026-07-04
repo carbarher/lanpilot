@@ -1,6 +1,7 @@
 use std::net::{Ipv4Addr, UdpSocket};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 pub const PRODUCT_NAME: &str = "LanPilot";
@@ -273,13 +274,13 @@ pub fn normalize_pair_code(raw: &str) -> Option<String> {
 }
 
 pub fn generate_pair_code() -> String {
-    let millis = unix_timestamp_ms() as u64;
-    format!("{:06}", (millis % 1_000_000))
+    let code = rand::thread_rng().gen_range(0u32..1_000_000);
+    format!("{code:06}")
 }
 
 fn generate_session_id() -> String {
-    let millis = unix_timestamp_ms();
-    format!("lp-{millis}")
+    let id: u64 = rand::thread_rng().r#gen();
+    format!("lp-{id:016x}")
 }
 
 pub fn unix_timestamp_ms() -> u128 {

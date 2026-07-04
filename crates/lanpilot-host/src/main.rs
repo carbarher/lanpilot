@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::{Arc, Mutex};
@@ -58,10 +59,14 @@ fn main() {
     let tuning = Arc::new(Mutex::new(StreamTuning::default()));
     let control_tuning = Arc::clone(&tuning);
     let stream_tuning = Arc::clone(&tuning);
-    let _control_thread = thread::spawn(move || run_control_server(control_tuning));
-    let _stream_thread = thread::spawn(move || run_stream_server(stream_tuning));
+    let active_sessions: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    let control_sessions = Arc::clone(&active_sessions);
+    let stream_sessions = Arc::clone(&active_sessions);
+    let handshake_sessions = Arc::clone(&active_sessions);
+    let _control_thread = thread::spawn(move || run_control_server(control_tuning, control_sessions));
+    let _stream_thread = thread::spawn(move || run_stream_server(stream_tuning, stream_sessions));
 
-    run_handshake_server(&host_name);
+    run_handshake_server(&host_name, handshake_sessions);
 }
 
 fn run_discovery_server(host_name: &str, host_ipv4: Ipv4Addr, pair_code: &str) {
@@ -117,7 +122,7 @@ fn run_discovery_server(host_name: &str, host_ipv4: Ipv4Addr, pair_code: &str) {
     }
 }
 
-fn run_handshake_server(host_name: &str) {
+fn run_handshake_server(host_name: &str, sessions: Arc<Mutex<HashSet<String>>>) {
     let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, HANDSHAKE_PORT))
         .expect("failed to bind TCP handshake listener");
 
@@ -125,8 +130,9 @@ fn run_handshake_server(host_name: &str) {
         match stream {
             Ok(stream) => {
                 let host_name = host_name.to_string();
+                let sessions = Arc::clone(&sessions);
                 thread::spawn(move || {
-                    if let Err(err) = handle_handshake(stream, &host_name) {
+                    if let Err(err) = handle_handshake(stream, &host_name, sessions) {
                         eprintln!("handshake error: {err}");
                     }
                 });
@@ -136,7 +142,7 @@ fn run_handshake_server(host_name: &str) {
     }
 }
 
-fn run_control_server(tuning: Arc<Mutex<StreamTuning>>) {
+fn run_control_server(tuning: Arc<Mutex<StreamTuning>>, sessions: Arc<Mutex<HashSet<String>>>) {
     let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, CONTROL_PORT))
         .expect("failed to bind TCP control listener");
 
@@ -144,14 +150,15 @@ fn run_control_server(tuning: Arc<Mutex<StreamTuning>>) {
         match stream {
             Ok(stream) => {
                 let tuning = Arc::clone(&tuning);
-                thread::spawn(move || handle_control_stream(stream, tuning));
+                let sessions = Arc::clone(&sessions);
+                thread::spawn(move || handle_control_stream(stream, tuning, sessions));
             }
             Err(err) => eprintln!("control incoming connection error: {err}"),
         }
     }
 }
 
-fn handle_control_stream(stream: TcpStream, tuning: Arc<Mutex<StreamTuning>>) {
+fn handle_control_stream(stream: TcpStream, tuning: Arc<Mutex<StreamTuning>>, sessions: Arc<Mutex<HashSet<String>>>) {
     let peer = match stream.peer_addr() {
         Ok(addr) => addr.to_string(),
         Err(err) => {
@@ -159,6 +166,12 @@ fn handle_control_stream(stream: TcpStream, tuning: Arc<Mutex<StreamTuning>>) {
             "<unknown>".to_string()
         }
     };
+
+    // Timeout prevents a slow/stalled sender from blocking this thread forever.
+    if let Err(err) = stream.set_read_timeout(Some(Duration::from_secs(30))) {
+        eprintln!("control set_read_timeout error from {peer}: {err}");
+        return;
+    }
 
     let mut reader = BufReader::new(stream);
     loop {
@@ -184,6 +197,17 @@ fn handle_control_stream(stream: TcpStream, tuning: Arc<Mutex<StreamTuning>>) {
 
         if frame.magic != PROTOCOL_MAGIC {
             eprintln!("ignoring control frame with invalid magic from {peer}");
+            continue;
+        }
+        let session_known = sessions
+            .lock()
+            .map(|guard| guard.contains(&frame.session_id))
+            .unwrap_or(false);
+        if !session_known {
+            eprintln!(
+                "ignoring control frame with unknown session {} from {peer}",
+                frame.session_id
+            );
             continue;
         }
 
@@ -227,7 +251,7 @@ fn handle_control_stream(stream: TcpStream, tuning: Arc<Mutex<StreamTuning>>) {
     }
 }
 
-fn run_stream_server(tuning: Arc<Mutex<StreamTuning>>) {
+fn run_stream_server(tuning: Arc<Mutex<StreamTuning>>, sessions: Arc<Mutex<HashSet<String>>>) {
     let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, STREAM_PORT))
         .expect("failed to bind TCP stream listener");
 
@@ -235,8 +259,9 @@ fn run_stream_server(tuning: Arc<Mutex<StreamTuning>>) {
         match stream {
             Ok(stream) => {
                 let tuning = Arc::clone(&tuning);
+                let sessions = Arc::clone(&sessions);
                 thread::spawn(move || {
-                    if let Err(err) = handle_stream_channel(stream, tuning) {
+                    if let Err(err) = handle_stream_channel(stream, tuning, sessions) {
                         eprintln!("stream channel error: {err}");
                     }
                 });
@@ -249,10 +274,15 @@ fn run_stream_server(tuning: Arc<Mutex<StreamTuning>>) {
 fn handle_stream_channel(
     mut stream: TcpStream,
     tuning: Arc<Mutex<StreamTuning>>,
+    sessions: Arc<Mutex<HashSet<String>>>,
 ) -> Result<(), String> {
     let peer = stream
         .peer_addr()
         .map_err(|err| format!("stream peer addr error: {err}"))?;
+    // Timeout on the hello read prevents permanent thread hang on non-sending clients.
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|err| format!("stream set_read_timeout error: {err}"))?;
     let mut reader = BufReader::new(
         stream
             .try_clone()
@@ -267,6 +297,16 @@ fn handle_stream_channel(
         from_json_line(&hello_line).map_err(|err| format!("invalid stream hello: {err}"))?;
     if hello.magic != PROTOCOL_MAGIC || hello.role != "agent" {
         return Err(format!("invalid stream hello payload: {:?}", hello));
+    }
+    let session_known = sessions
+        .lock()
+        .map(|guard| guard.contains(&hello.session_id))
+        .unwrap_or(false);
+    if !session_known {
+        return Err(format!(
+            "stream hello with unknown session {} from {peer}",
+            hello.session_id
+        ));
     }
 
     println!(
@@ -379,7 +419,18 @@ impl ScreenCapture {
             }
         };
 
-        let stride_bytes = bytes.len() / self.height as usize;
+        let stride_bytes = if self.height == 0 {
+            return Err("screen capture: display height is zero".to_string());
+        } else {
+            bytes.len() / self.height as usize
+        };
+        if stride_bytes < self.width as usize * 4 {
+            return Err(format!(
+                "screen capture: stride {stride_bytes} < expected {} ({} * 4)",
+                self.width as usize * 4,
+                self.width
+            ));
+        }
         let (scaled, width, height, scaled_stride) =
             normalize_and_scale_bgra(&bytes, self.width, self.height, stride_bytes, scale_divisor);
         let compressed = compress_prepend_size(&scaled);
@@ -446,10 +497,15 @@ fn normalize_and_scale_bgra(
     (out, out_width as u32, out_height as u32, out_stride)
 }
 
-fn handle_handshake(mut stream: TcpStream, host_name: &str) -> Result<(), String> {
+fn handle_handshake(mut stream: TcpStream, host_name: &str, sessions: Arc<Mutex<HashSet<String>>>) -> Result<(), String> {
     let remote: SocketAddr = stream
         .peer_addr()
         .map_err(|err| format!("peer addr error: {err}"))?;
+
+    // Timeout prevents a client that connects but never sends from blocking the thread forever.
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|err| format!("set read timeout error: {err}"))?;
 
     let mut reader = BufReader::new(
         stream
@@ -478,6 +534,10 @@ fn handle_handshake(mut stream: TcpStream, host_name: &str) -> Result<(), String
         IpAddr::V4(ip) => ip.to_string(),
         IpAddr::V6(ip) => ip.to_string(),
     };
+    // Register the session so control/stream channels can validate it.
+    if let Ok(mut guard) = sessions.lock() {
+        guard.insert(ack.session_id.clone());
+    }
     println!(
         "Handshake accepted: agent={} remote={} session={}",
         hello.agent_name, source_ip, ack.session_id
