@@ -1,11 +1,12 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::thread;
+use std::time::Duration;
 
 use lanpilot_core::{
     CONTROL_PORT, ControlFrame, DISCOVERY_PORT, DiscoveryProbe, DiscoveryResponse, HANDSHAKE_PORT,
-    HandshakeAck, HandshakeHello, PRODUCT_NAME, PROTOCOL_MAGIC, TAGLINE, from_json_line,
-    local_ipv4, to_json_line,
+    HandshakeAck, HandshakeHello, PRODUCT_NAME, PROTOCOL_MAGIC, STREAM_PORT, StreamFrame,
+    StreamHello, TAGLINE, from_json_line, local_ipv4, to_json_line,
 };
 
 fn main() {
@@ -17,6 +18,7 @@ fn main() {
     println!("Listening for discovery on UDP {DISCOVERY_PORT}");
     println!("Listening for handshakes on TCP {HANDSHAKE_PORT}");
     println!("Listening for control channel on TCP {CONTROL_PORT}");
+    println!("Listening for stream channel on TCP {STREAM_PORT}");
     println!("Host identity: {host_name} ({host_ipv4})");
 
     let discovery_name = host_name.clone();
@@ -24,6 +26,7 @@ fn main() {
     let _discovery_thread =
         thread::spawn(move || run_discovery_server(&discovery_name, discovery_ip));
     let _control_thread = thread::spawn(run_control_server);
+    let _stream_thread = thread::spawn(run_stream_server);
 
     run_handshake_server(&host_name);
 }
@@ -153,6 +156,70 @@ fn handle_control_stream(stream: TcpStream) {
             frame.events.len()
         );
     }
+}
+
+fn run_stream_server() {
+    let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, STREAM_PORT))
+        .expect("failed to bind TCP stream listener");
+
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                thread::spawn(move || {
+                    if let Err(err) = handle_stream_channel(stream) {
+                        eprintln!("stream channel error: {err}");
+                    }
+                });
+            }
+            Err(err) => eprintln!("stream incoming connection error: {err}"),
+        }
+    }
+}
+
+fn handle_stream_channel(mut stream: TcpStream) -> Result<(), String> {
+    let peer = stream
+        .peer_addr()
+        .map_err(|err| format!("stream peer addr error: {err}"))?;
+    let mut reader = BufReader::new(
+        stream
+            .try_clone()
+            .map_err(|err| format!("stream clone error: {err}"))?,
+    );
+
+    let mut hello_line = String::new();
+    reader
+        .read_line(&mut hello_line)
+        .map_err(|err| format!("stream read hello failed: {err}"))?;
+    let hello: StreamHello =
+        from_json_line(&hello_line).map_err(|err| format!("invalid stream hello: {err}"))?;
+    if hello.magic != PROTOCOL_MAGIC || hello.role != "agent" {
+        return Err(format!("invalid stream hello payload: {:?}", hello));
+    }
+
+    println!(
+        "Stream channel established: session={} agent={} source={}",
+        hello.session_id, hello.agent_name, peer
+    );
+
+    for sequence in 0..5_u64 {
+        let frame = StreamFrame::synthetic(hello.session_id.clone(), sequence);
+        let encoded =
+            to_json_line(&frame).map_err(|err| format!("encode stream frame failed: {err}"))?;
+        if let Err(err) = stream.write_all(encoded.as_bytes()) {
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionReset
+            ) {
+                break;
+            }
+            return Err(format!("send stream frame failed: {err}"));
+        }
+        thread::sleep(Duration::from_millis(120));
+    }
+
+    Ok(())
 }
 
 fn handle_handshake(mut stream: TcpStream, host_name: &str) -> Result<(), String> {

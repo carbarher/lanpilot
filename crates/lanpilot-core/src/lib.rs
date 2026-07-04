@@ -9,6 +9,7 @@ pub const PROTOCOL_MAGIC: &str = "LANPILOT_V1";
 pub const DISCOVERY_PORT: u16 = 47042;
 pub const HANDSHAKE_PORT: u16 = 47043;
 pub const CONTROL_PORT: u16 = 47044;
+pub const STREAM_PORT: u16 = 47045;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeIdentity {
@@ -83,6 +84,7 @@ pub struct HandshakeAck {
     pub host_name: String,
     pub session_id: String,
     pub control_port: u16,
+    pub stream_port: u16,
 }
 
 impl HandshakeAck {
@@ -93,6 +95,7 @@ impl HandshakeAck {
             host_name: host_name.into(),
             session_id: generate_session_id(),
             control_port: CONTROL_PORT,
+            stream_port: STREAM_PORT,
         }
     }
 }
@@ -167,6 +170,50 @@ impl ControlFrame {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamHello {
+    pub magic: String,
+    pub role: String,
+    pub session_id: String,
+    pub agent_name: String,
+}
+
+impl StreamHello {
+    pub fn new(session_id: impl Into<String>, agent_name: impl Into<String>) -> Self {
+        Self {
+            magic: PROTOCOL_MAGIC.to_string(),
+            role: "agent".to_string(),
+            session_id: session_id.into(),
+            agent_name: agent_name.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamFrame {
+    pub magic: String,
+    pub session_id: String,
+    pub sequence: u64,
+    pub width: u32,
+    pub height: u32,
+    pub pixel_format: String,
+    pub payload_hint: String,
+}
+
+impl StreamFrame {
+    pub fn synthetic(session_id: impl Into<String>, sequence: u64) -> Self {
+        Self {
+            magic: PROTOCOL_MAGIC.to_string(),
+            session_id: session_id.into(),
+            sequence,
+            width: 1280,
+            height: 720,
+            pixel_format: "rgba8".to_string(),
+            payload_hint: format!("synthetic-frame-{sequence}"),
+        }
+    }
+}
+
 pub fn to_json_line<T: Serialize>(value: &T) -> Result<String, serde_json::Error> {
     let mut line = serde_json::to_string(value)?;
     line.push('\n');
@@ -231,6 +278,7 @@ mod tests {
         let ack = HandshakeAck::ok("pc-host");
         assert_eq!(ack.status, "ok");
         assert_eq!(ack.control_port, CONTROL_PORT);
+        assert_eq!(ack.stream_port, STREAM_PORT);
         assert!(ack.session_id.starts_with("lp-"));
     }
 
@@ -260,6 +308,14 @@ mod tests {
         );
         let line = to_json_line(&frame).expect("must serialize control frame");
         let decoded: ControlFrame = from_json_line(&line).expect("must deserialize control frame");
+        assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn stream_frame_roundtrip_json_line() {
+        let frame = StreamFrame::synthetic("lp-xyz", 7);
+        let line = to_json_line(&frame).expect("must serialize stream frame");
+        let decoded: StreamFrame = from_json_line(&line).expect("must deserialize stream frame");
         assert_eq!(decoded, frame);
     }
 }

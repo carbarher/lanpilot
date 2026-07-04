@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use lanpilot_core::{
     ControlEvent, ControlFrame, DISCOVERY_PORT, DiscoveryProbe, DiscoveryResponse, EdgeDirection,
-    EdgeSwitchConfig, HandshakeAck, HandshakeHello, PRODUCT_NAME, PROTOCOL_MAGIC, TAGLINE,
-    from_json_line, should_switch_to_remote, to_json_line,
+    EdgeSwitchConfig, HandshakeAck, HandshakeHello, PRODUCT_NAME, PROTOCOL_MAGIC, StreamFrame,
+    StreamHello, TAGLINE, from_json_line, should_switch_to_remote, to_json_line,
 };
 
 fn main() -> Result<(), String> {
@@ -28,6 +28,7 @@ fn main() -> Result<(), String> {
     );
 
     run_phase2_input_channel(&discovered.host_ipv4, &ack)?;
+    run_phase3_stream_channel(&discovered.host_ipv4, &agent_name, &ack)?;
 
     Ok(())
 }
@@ -139,6 +140,52 @@ fn run_phase2_input_channel(host_ipv4: &str, ack: &HandshakeAck) -> Result<(), S
         "Phase 2: edge-switch triggered, sent {} input events to control channel {}",
         frame.events.len(),
         endpoint
+    );
+    Ok(())
+}
+
+fn run_phase3_stream_channel(
+    host_ipv4: &str,
+    agent_name: &str,
+    ack: &HandshakeAck,
+) -> Result<(), String> {
+    let endpoint = format!("{}:{}", host_ipv4, ack.stream_port);
+    let mut stream = TcpStream::connect(endpoint.as_str())
+        .map_err(|err| format!("connect stream socket failed: {err}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|err| format!("set stream read timeout failed: {err}"))?;
+
+    let hello = StreamHello::new(ack.session_id.clone(), agent_name.to_string());
+    let hello_line =
+        to_json_line(&hello).map_err(|err| format!("encode stream hello failed: {err}"))?;
+    stream
+        .write_all(hello_line.as_bytes())
+        .map_err(|err| format!("send stream hello failed: {err}"))?;
+
+    let mut reader = BufReader::new(stream);
+    let mut received = 0_u32;
+    let mut last_sequence = 0_u64;
+    while received < 3 {
+        let mut line = String::new();
+        let bytes_read = reader
+            .read_line(&mut line)
+            .map_err(|err| format!("read stream frame failed: {err}"))?;
+        if bytes_read == 0 {
+            break;
+        }
+        let frame: StreamFrame =
+            from_json_line(&line).map_err(|err| format!("decode stream frame failed: {err}"))?;
+        if frame.magic != PROTOCOL_MAGIC || frame.session_id != ack.session_id {
+            return Err(format!("invalid stream frame payload: {:?}", frame));
+        }
+        received += 1;
+        last_sequence = frame.sequence;
+    }
+
+    println!(
+        "Phase 3: stream channel active, received {} synthetic frames (last sequence={})",
+        received, last_sequence
     );
     Ok(())
 }

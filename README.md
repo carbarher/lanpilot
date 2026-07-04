@@ -47,3 +47,11 @@ After the handshake succeeds:
 - agent evaluates right-edge crossing (`EdgeSwitchConfig`)
 - when edge threshold is reached, agent sends a control frame over TCP (`47044`)
 - host accepts the control frame and logs the remote input event batch
+
+### Phase 3 MVP: initial screen stream transport
+
+After Phase 2:
+
+- agent opens stream channel on TCP (`47045`)
+- agent sends `StreamHello` with current session id
+- host streams synthetic frames (`StreamFrame`) to validate capture/transport flow
