@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/LanPilot.Agent/LanPilot.Agent.csproj" />
+    <Project Path="src/LanPilot.Core/LanPilot.Core.csproj" />
+    <Project Path="src/LanPilot.Host/LanPilot.Host.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/LanPilot.Core.Tests/LanPilot.Core.Tests.csproj" />
+  </Folder>
+</Solution>
