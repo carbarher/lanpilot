@@ -8,8 +8,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use lanpilot_core::{
     CONTROL_PORT, ControlEvent, ControlFrame, DISCOVERY_PORT, DiscoveryProbe, DiscoveryResponse,
     HANDSHAKE_PORT, HandshakeAck, HandshakeHello, PRODUCT_NAME, PROTOCOL_MAGIC, STREAM_PORT,
-    StreamCompression, StreamFrame, StreamHello, TAGLINE, from_json_line, local_ipv4, to_json_line,
-    unix_timestamp_ms,
+    StreamCompression, StreamFrame, StreamHello, TAGLINE, from_json_line, generate_pair_code,
+    local_ipv4, normalize_pair_code, to_json_line, unix_timestamp_ms,
 };
 use lz4_flex::compress_prepend_size;
 use scrap::{Capturer, Display};
@@ -32,9 +32,18 @@ impl Default for StreamTuning {
 fn main() {
     let host_name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "lanpilot-host".to_string());
     let host_ipv4 = local_ipv4().unwrap_or(Ipv4Addr::LOCALHOST);
+    let pair_code = std::env::var("LANPILOT_PAIR_CODE")
+        .ok()
+        .and_then(|raw| normalize_pair_code(&raw))
+        .unwrap_or_else(generate_pair_code);
 
     println!("{PRODUCT_NAME} Host");
     println!("{TAGLINE}");
+    println!();
+    println!("=== Compartir mi pantalla ===");
+    println!("Codigo para conectar: {pair_code}");
+    println!("Abre LanPilot en otro equipo y elige 'Conectarme'.");
+    println!();
     println!("Listening for discovery on UDP {DISCOVERY_PORT}");
     println!("Listening for handshakes on TCP {HANDSHAKE_PORT}");
     println!("Listening for control channel on TCP {CONTROL_PORT}");
@@ -43,8 +52,9 @@ fn main() {
 
     let discovery_name = host_name.clone();
     let discovery_ip = host_ipv4;
+    let discovery_code = pair_code.clone();
     let _discovery_thread =
-        thread::spawn(move || run_discovery_server(&discovery_name, discovery_ip));
+        thread::spawn(move || run_discovery_server(&discovery_name, discovery_ip, &discovery_code));
     let tuning = Arc::new(Mutex::new(StreamTuning::default()));
     let control_tuning = Arc::clone(&tuning);
     let stream_tuning = Arc::clone(&tuning);
@@ -54,7 +64,7 @@ fn main() {
     run_handshake_server(&host_name);
 }
 
-fn run_discovery_server(host_name: &str, host_ipv4: Ipv4Addr) {
+fn run_discovery_server(host_name: &str, host_ipv4: Ipv4Addr, pair_code: &str) {
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, DISCOVERY_PORT))
         .expect("failed to bind UDP discovery socket");
     let mut buffer = [0_u8; 2048];
@@ -86,6 +96,9 @@ fn run_discovery_server(host_name: &str, host_ipv4: Ipv4Addr) {
 
         if probe.magic != PROTOCOL_MAGIC {
             eprintln!("ignoring probe with invalid magic from {source}");
+            continue;
+        }
+        if probe.pair_code != pair_code {
             continue;
         }
 

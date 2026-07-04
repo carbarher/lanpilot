@@ -1,4 +1,4 @@
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
 use std::time::{Duration, Instant};
 
@@ -6,8 +6,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use lanpilot_core::{
     ControlEvent, ControlFrame, DISCOVERY_PORT, DiscoveryProbe, DiscoveryResponse, EdgeDirection,
     EdgeSwitchConfig, HandshakeAck, HandshakeHello, PRODUCT_NAME, PROTOCOL_MAGIC,
-    StreamCompression, StreamFrame, StreamHello, TAGLINE, from_json_line, should_switch_to_remote,
-    to_json_line, unix_timestamp_ms,
+    StreamCompression, StreamFrame, StreamHello, TAGLINE, from_json_line, normalize_pair_code,
+    should_switch_to_remote, to_json_line, unix_timestamp_ms,
 };
 use lz4_flex::decompress_size_prepended;
 use minifb::{Scale, Window, WindowOptions};
@@ -17,9 +17,12 @@ fn main() -> Result<(), String> {
 
     println!("{PRODUCT_NAME} Agent");
     println!("{TAGLINE}");
+    println!();
+    println!("=== Conectarme ===");
+    let pair_code = read_pair_code()?;
     println!("Sending discovery broadcast on UDP {DISCOVERY_PORT}...");
 
-    let discovered = discover_host(&agent_name)?;
+    let discovered = discover_host(&agent_name, &pair_code)?;
     println!(
         "Discovered host {} at {}:{}",
         discovered.host_name, discovered.host_ipv4, discovered.handshake_port
@@ -37,7 +40,7 @@ fn main() -> Result<(), String> {
     Ok(())
 }
 
-fn discover_host(agent_name: &str) -> Result<DiscoveryResponse, String> {
+fn discover_host(agent_name: &str, pair_code: &str) -> Result<DiscoveryResponse, String> {
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
         .map_err(|err| format!("bind discovery socket failed: {err}"))?;
     socket
@@ -47,7 +50,7 @@ fn discover_host(agent_name: &str) -> Result<DiscoveryResponse, String> {
         .set_read_timeout(Some(Duration::from_millis(2_000)))
         .map_err(|err| format!("set read timeout failed: {err}"))?;
 
-    let probe = DiscoveryProbe::new(agent_name.to_string());
+    let probe = DiscoveryProbe::new(agent_name.to_string(), pair_code.to_string());
     let payload = to_json_line(&probe).map_err(|err| format!("encode probe failed: {err}"))?;
     let target = SocketAddr::from((Ipv4Addr::BROADCAST, DISCOVERY_PORT));
     socket
@@ -69,7 +72,29 @@ fn discover_host(agent_name: &str) -> Result<DiscoveryResponse, String> {
             response.magic
         ));
     }
+
     Ok(response)
+}
+
+fn read_pair_code() -> Result<String, String> {
+    if let Ok(raw) = std::env::var("LANPILOT_PAIR_CODE") {
+        if let Some(code) = normalize_pair_code(&raw) {
+            println!("Usando codigo de conexion desde LANPILOT_PAIR_CODE.");
+            return Ok(code);
+        }
+        return Err("LANPILOT_PAIR_CODE debe tener exactamente 6 digitos".to_string());
+    }
+
+    print!("Introduce el codigo de 6 digitos: ");
+    io::stdout()
+        .flush()
+        .map_err(|err| format!("flush stdout failed: {err}"))?;
+
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .map_err(|err| format!("read pair code failed: {err}"))?;
+    normalize_pair_code(&input).ok_or_else(|| "Codigo invalido: usa 6 digitos".to_string())
 }
 
 fn perform_handshake(

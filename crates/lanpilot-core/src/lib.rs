@@ -30,13 +30,15 @@ impl NodeIdentity {
 pub struct DiscoveryProbe {
     pub magic: String,
     pub agent_name: String,
+    pub pair_code: String,
 }
 
 impl DiscoveryProbe {
-    pub fn new(agent_name: impl Into<String>) -> Self {
+    pub fn new(agent_name: impl Into<String>, pair_code: impl Into<String>) -> Self {
         Self {
             magic: PROTOCOL_MAGIC.to_string(),
             agent_name: agent_name.into(),
+            pair_code: pair_code.into(),
         }
     }
 }
@@ -261,6 +263,20 @@ pub fn local_ipv4() -> Option<Ipv4Addr> {
     }
 }
 
+pub fn normalize_pair_code(raw: &str) -> Option<String> {
+    let digits: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() == 6 {
+        Some(digits)
+    } else {
+        None
+    }
+}
+
+pub fn generate_pair_code() -> String {
+    let millis = unix_timestamp_ms() as u64;
+    format!("{:06}", (millis % 1_000_000))
+}
+
 fn generate_session_id() -> String {
     let millis = unix_timestamp_ms();
     format!("lp-{millis}")
@@ -292,10 +308,17 @@ mod tests {
 
     #[test]
     fn discovery_probe_roundtrip_json_line() {
-        let probe = DiscoveryProbe::new("pc-agent");
+        let probe = DiscoveryProbe::new("pc-agent", "123456");
         let line = to_json_line(&probe).expect("must serialize probe");
         let decoded: DiscoveryProbe = from_json_line(&line).expect("must deserialize probe");
         assert_eq!(decoded, probe);
+    }
+
+    #[test]
+    fn normalize_pair_code_accepts_six_digits() {
+        assert_eq!(normalize_pair_code("12 34-56"), Some("123456".to_string()));
+        assert_eq!(normalize_pair_code("12345"), None);
+        assert_eq!(normalize_pair_code("1234567"), None);
     }
 
     #[test]

@@ -20,6 +20,32 @@ cargo build
 cargo test
 ```
 
+### Simple flow (for normal users)
+
+1. On host PC:
+
+```powershell
+cargo run -p lanpilot-host
+```
+
+You will see a 6-digit connection code.
+
+2. On client PC:
+
+```powershell
+cargo run -p lanpilot-agent
+```
+
+Enter the same 6-digit code when asked.
+
+Optional non-interactive mode:
+
+```powershell
+$env:LANPILOT_PAIR_CODE = "123456"
+cargo run -p lanpilot-host
+cargo run -p lanpilot-agent
+```
+
 ### Phase 1 MVP: discovery + handshake
 
 Start host (terminal 1):
