@@ -1,0 +1,12 @@
+[workspace]
+members = [
+    "crates/lanpilot-core",
+    "crates/lanpilot-host",
+    "crates/lanpilot-agent",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/carbarher/lanpilot"

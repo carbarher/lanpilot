@@ -9,16 +9,15 @@ LanPilot is a LAN-first remote desktop control project designed to pair naturall
 
 ## Initial MVP structure
 
-- `src/LanPilot.Host` - host-side desktop controller entrypoint
-- `src/LanPilot.Agent` - agent-side session/runtime entrypoint
-- `src/LanPilot.Core` - shared domain and protocol primitives
-- `tests/LanPilot.Core.Tests` - unit tests for shared core
+- `crates/lanpilot-host` - host-side desktop controller entrypoint
+- `crates/lanpilot-agent` - agent-side session/runtime entrypoint
+- `crates/lanpilot-core` - shared domain and protocol primitives
 
 ## Quick start
 
 ```powershell
-dotnet build .\LanPilot.slnx
-dotnet test .\LanPilot.slnx
-dotnet run --project .\src\LanPilot.Host\LanPilot.Host.csproj
-dotnet run --project .\src\LanPilot.Agent\LanPilot.Agent.csproj
+cargo build
+cargo test
+cargo run -p lanpilot-host
+cargo run -p lanpilot-agent
 ```
