@@ -7,3 +7,4 @@ edition = "2024"
 base64 = "0.22"
 lanpilot-core = { path = "../lanpilot-core" }
 lz4_flex = "0.11"
+minifb = "0.27"

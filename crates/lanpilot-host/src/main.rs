@@ -210,7 +210,13 @@ fn handle_stream_channel(mut stream: TcpStream) -> Result<(), String> {
     let mut capture = if source_mode.eq_ignore_ascii_case("synthetic") {
         None
     } else {
-        Some(ScreenCapture::new()?)
+        match ScreenCapture::new() {
+            Ok(capture) => Some(capture),
+            Err(err) => {
+                eprintln!("stream capture unavailable, using synthetic source: {err}");
+                None
+            }
+        }
     };
 
     for sequence in 0..30_u64 {
@@ -285,6 +291,7 @@ impl ScreenCapture {
             }
         };
 
+        let stride_bytes = bytes.len() / self.height as usize;
         let compressed = compress_prepend_size(&bytes);
         let encoded = BASE64.encode(compressed);
         Ok(StreamFrame {
@@ -294,6 +301,7 @@ impl ScreenCapture {
             captured_at_ms: unix_timestamp_ms(),
             width: self.width,
             height: self.height,
+            stride_bytes,
             pixel_format: "bgra8".to_string(),
             compression: StreamCompression::Lz4,
             frame_interval_ms,

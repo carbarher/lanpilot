@@ -63,6 +63,17 @@ After Phase 2:
 - host applies frame pacing (`frame_interval_ms`, target ~10 FPS)
 - agent validates and decompresses incoming frames
 
+### Phase 5 MVP: agent rendering + stream metrics
+
+- agent renders incoming stream frames in a window (`minifb`)
+- stream metrics are printed: FPS, average latency, jitter
+- renderer can be disabled for headless validation:
+
+```powershell
+$env:LANPILOT_RENDER = "0"
+cargo run -p lanpilot-agent
+```
+
 Optional fallback for environments without desktop capture:
 
 ```powershell

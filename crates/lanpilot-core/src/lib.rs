@@ -197,6 +197,7 @@ pub struct StreamFrame {
     pub captured_at_ms: u128,
     pub width: u32,
     pub height: u32,
+    pub stride_bytes: usize,
     pub pixel_format: String,
     pub compression: StreamCompression,
     pub frame_interval_ms: u32,
@@ -214,19 +215,21 @@ pub enum StreamCompression {
 
 impl StreamFrame {
     pub fn synthetic(session_id: impl Into<String>, sequence: u64) -> Self {
-        let payload = format!("synthetic-frame-{sequence}");
+        let width = 960;
+        let height = 540;
         Self {
             magic: PROTOCOL_MAGIC.to_string(),
             session_id: session_id.into(),
             sequence,
             captured_at_ms: unix_timestamp_ms(),
-            width: 1280,
-            height: 720,
+            width,
+            height,
+            stride_bytes: width as usize * 4,
             pixel_format: "rgba8".to_string(),
             compression: StreamCompression::None,
             frame_interval_ms: 100,
-            compressed_payload_b64: payload,
-            raw_len: 0,
+            compressed_payload_b64: String::new(),
+            raw_len: width as usize * height as usize * 4,
             source: "synthetic".to_string(),
         }
     }
@@ -347,6 +350,7 @@ mod tests {
         assert_eq!(frame.compression, StreamCompression::None);
         assert_eq!(frame.source, "synthetic");
         assert_eq!(frame.frame_interval_ms, 100);
-        assert!(frame.compressed_payload_b64.starts_with("synthetic-frame-"));
+        assert_eq!(frame.stride_bytes, frame.width as usize * 4);
+        assert!(frame.compressed_payload_b64.is_empty());
     }
 }

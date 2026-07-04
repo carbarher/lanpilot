@@ -1,15 +1,16 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use lanpilot_core::{
     ControlEvent, ControlFrame, DISCOVERY_PORT, DiscoveryProbe, DiscoveryResponse, EdgeDirection,
     EdgeSwitchConfig, HandshakeAck, HandshakeHello, PRODUCT_NAME, PROTOCOL_MAGIC,
     StreamCompression, StreamFrame, StreamHello, TAGLINE, from_json_line, should_switch_to_remote,
-    to_json_line,
+    to_json_line, unix_timestamp_ms,
 };
 use lz4_flex::decompress_size_prepended;
+use minifb::{Scale, Window, WindowOptions};
 
 fn main() -> Result<(), String> {
     let agent_name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "lanpilot-agent".to_string());
@@ -167,10 +168,18 @@ fn run_phase3_stream_channel(
         .map_err(|err| format!("send stream hello failed: {err}"))?;
 
     let mut reader = BufReader::new(stream);
+    let mut renderer = FrameRenderer::try_new()?;
+    let mut metrics = StreamMetrics::new();
+    let target_frames = std::env::var("LANPILOT_STREAM_FRAMES")
+        .ok()
+        .and_then(|raw| raw.parse::<u32>().ok())
+        .unwrap_or(60);
+
     let mut received = 0_u32;
     let mut last_sequence = 0_u64;
     let mut total_raw = 0_usize;
-    while received < 3 {
+
+    while received < target_frames {
         let mut line = String::new();
         let bytes_read = reader
             .read_line(&mut line)
@@ -183,32 +192,206 @@ fn run_phase3_stream_channel(
         if frame.magic != PROTOCOL_MAGIC || frame.session_id != ack.session_id {
             return Err(format!("invalid stream frame payload: {:?}", frame));
         }
-        let raw_len = match frame.compression {
-            StreamCompression::None => frame.compressed_payload_b64.len(),
-            StreamCompression::Lz4 => {
-                let compressed = BASE64
-                    .decode(frame.compressed_payload_b64.as_bytes())
-                    .map_err(|err| format!("base64 decode failed: {err}"))?;
-                let raw = decompress_size_prepended(&compressed)
-                    .map_err(|err| format!("lz4 decompress failed: {err}"))?;
-                if frame.raw_len != 0 && raw.len() != frame.raw_len {
-                    return Err(format!(
-                        "raw length mismatch expected={} got={}",
-                        frame.raw_len,
-                        raw.len()
-                    ));
-                }
-                raw.len()
+
+        let raw = decode_stream_frame(&frame)?;
+        if let Some(renderer) = renderer.as_mut() {
+            renderer.render(&frame, &raw)?;
+            if !renderer.is_open() {
+                break;
             }
-        };
+        }
+
         received += 1;
         last_sequence = frame.sequence;
-        total_raw += raw_len;
+        total_raw += raw.len();
+        metrics.observe(frame.captured_at_ms);
     }
 
+    let summary = metrics.summary();
     println!(
-        "Phase 4: stream channel active, received {} frames (last sequence={}, total raw bytes={})",
-        received, last_sequence, total_raw
+        "Phase 5: stream/render active, frames={} last_seq={} raw={} fps={:.2} avg_latency_ms={:.2} jitter_ms={:.2}",
+        received, last_sequence, total_raw, summary.fps, summary.avg_latency_ms, summary.jitter_ms
     );
     Ok(())
+}
+
+fn decode_stream_frame(frame: &StreamFrame) -> Result<Vec<u8>, String> {
+    match frame.compression {
+        StreamCompression::None => Ok(generate_synthetic_bgra(frame)),
+        StreamCompression::Lz4 => {
+            let compressed = BASE64
+                .decode(frame.compressed_payload_b64.as_bytes())
+                .map_err(|err| format!("base64 decode failed: {err}"))?;
+            let raw = decompress_size_prepended(&compressed)
+                .map_err(|err| format!("lz4 decompress failed: {err}"))?;
+            if frame.raw_len != 0 && raw.len() != frame.raw_len {
+                return Err(format!(
+                    "raw length mismatch expected={} got={}",
+                    frame.raw_len,
+                    raw.len()
+                ));
+            }
+            Ok(raw)
+        }
+    }
+}
+
+fn generate_synthetic_bgra(frame: &StreamFrame) -> Vec<u8> {
+    let width = frame.width as usize;
+    let height = frame.height as usize;
+    let mut raw = vec![0_u8; width * height * 4];
+    for y in 0..height {
+        for x in 0..width {
+            let idx = (y * width + x) * 4;
+            let blue = ((x + frame.sequence as usize) % 256) as u8;
+            let green = ((y + frame.sequence as usize * 2) % 256) as u8;
+            let red = ((x / 2 + y / 2 + frame.sequence as usize) % 256) as u8;
+            raw[idx] = blue;
+            raw[idx + 1] = green;
+            raw[idx + 2] = red;
+            raw[idx + 3] = 255;
+        }
+    }
+    raw
+}
+
+struct FrameRenderer {
+    window: Window,
+    width: usize,
+    height: usize,
+    buffer: Vec<u32>,
+}
+
+impl FrameRenderer {
+    fn try_new() -> Result<Option<Self>, String> {
+        let render_enabled = std::env::var("LANPILOT_RENDER")
+            .map(|raw| raw != "0")
+            .unwrap_or(true);
+        if !render_enabled {
+            return Ok(None);
+        }
+
+        let width = 1280;
+        let height = 720;
+        let options = WindowOptions {
+            resize: true,
+            scale: Scale::X1,
+            ..WindowOptions::default()
+        };
+        let mut window = Window::new("LanPilot Agent Stream", width, height, options)
+            .map_err(|err| format!("create render window failed: {err}"))?;
+        window.set_target_fps(60);
+        Ok(Some(Self {
+            window,
+            width,
+            height,
+            buffer: vec![0_u32; width * height],
+        }))
+    }
+
+    fn render(&mut self, frame: &StreamFrame, raw: &[u8]) -> Result<(), String> {
+        let width = frame.width as usize;
+        let height = frame.height as usize;
+        let stride_bytes = frame.stride_bytes;
+        if stride_bytes < width * 4 {
+            return Err(format!(
+                "invalid stride {} (expected at least {})",
+                stride_bytes,
+                width * 4
+            ));
+        }
+        if raw.len() < stride_bytes * height {
+            return Err(format!(
+                "insufficient raw data {} for stride {} and height {}",
+                raw.len(),
+                stride_bytes,
+                height
+            ));
+        }
+
+        if self.width != width || self.height != height {
+            self.width = width;
+            self.height = height;
+            self.buffer.resize(width * height, 0);
+        }
+
+        for y in 0..height {
+            let row_start = y * stride_bytes;
+            for x in 0..width {
+                let idx = row_start + x * 4;
+                let b = raw[idx] as u32;
+                let g = raw[idx + 1] as u32;
+                let r = raw[idx + 2] as u32;
+                self.buffer[y * width + x] = (r << 16) | (g << 8) | b;
+            }
+        }
+
+        self.window
+            .update_with_buffer(&self.buffer, width, height)
+            .map_err(|err| format!("render update failed: {err}"))
+    }
+
+    fn is_open(&self) -> bool {
+        self.window.is_open()
+    }
+}
+
+struct StreamMetrics {
+    started_at: Instant,
+    previous_arrival: Option<Instant>,
+    frame_count: u64,
+    total_latency_ms: f64,
+    jitter_ms: f64,
+}
+
+impl StreamMetrics {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            previous_arrival: None,
+            frame_count: 0,
+            total_latency_ms: 0.0,
+            jitter_ms: 0.0,
+        }
+    }
+
+    fn observe(&mut self, captured_at_ms: u128) {
+        let now = Instant::now();
+        self.frame_count += 1;
+
+        let now_ms = unix_timestamp_ms() as f64;
+        let captured_ms = captured_at_ms as f64;
+        if now_ms >= captured_ms {
+            self.total_latency_ms += now_ms - captured_ms;
+        }
+
+        if let Some(previous) = self.previous_arrival {
+            let interval_ms = (now - previous).as_secs_f64() * 1000.0;
+            let expected_ms = 100.0;
+            let deviation = (interval_ms - expected_ms).abs();
+            self.jitter_ms = (self.jitter_ms * 0.85) + (deviation * 0.15);
+        }
+        self.previous_arrival = Some(now);
+    }
+
+    fn summary(&self) -> StreamSummary {
+        let elapsed = self.started_at.elapsed().as_secs_f64().max(0.001);
+        let fps = self.frame_count as f64 / elapsed;
+        let avg_latency_ms = if self.frame_count == 0 {
+            0.0
+        } else {
+            self.total_latency_ms / self.frame_count as f64
+        };
+        StreamSummary {
+            fps,
+            avg_latency_ms,
+            jitter_ms: self.jitter_ms,
+        }
+    }
+}
+
+struct StreamSummary {
+    fps: f64,
+    avg_latency_ms: f64,
+    jitter_ms: f64,
 }
