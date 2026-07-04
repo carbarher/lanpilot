@@ -3,9 +3,9 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::thread;
 
 use lanpilot_core::{
-    DISCOVERY_PORT, DiscoveryProbe, DiscoveryResponse, HANDSHAKE_PORT, HandshakeAck,
-    HandshakeHello, PRODUCT_NAME, PROTOCOL_MAGIC, TAGLINE, from_json_line, local_ipv4,
-    to_json_line,
+    CONTROL_PORT, ControlFrame, DISCOVERY_PORT, DiscoveryProbe, DiscoveryResponse, HANDSHAKE_PORT,
+    HandshakeAck, HandshakeHello, PRODUCT_NAME, PROTOCOL_MAGIC, TAGLINE, from_json_line,
+    local_ipv4, to_json_line,
 };
 
 fn main() {
@@ -16,12 +16,14 @@ fn main() {
     println!("{TAGLINE}");
     println!("Listening for discovery on UDP {DISCOVERY_PORT}");
     println!("Listening for handshakes on TCP {HANDSHAKE_PORT}");
+    println!("Listening for control channel on TCP {CONTROL_PORT}");
     println!("Host identity: {host_name} ({host_ipv4})");
 
     let discovery_name = host_name.clone();
     let discovery_ip = host_ipv4;
     let _discovery_thread =
         thread::spawn(move || run_discovery_server(&discovery_name, discovery_ip));
+    let _control_thread = thread::spawn(run_control_server);
 
     run_handshake_server(&host_name);
 }
@@ -92,6 +94,64 @@ fn run_handshake_server(host_name: &str) {
             }
             Err(err) => eprintln!("incoming connection error: {err}"),
         }
+    }
+}
+
+fn run_control_server() {
+    let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, CONTROL_PORT))
+        .expect("failed to bind TCP control listener");
+
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                thread::spawn(move || handle_control_stream(stream));
+            }
+            Err(err) => eprintln!("control incoming connection error: {err}"),
+        }
+    }
+}
+
+fn handle_control_stream(stream: TcpStream) {
+    let peer = match stream.peer_addr() {
+        Ok(addr) => addr.to_string(),
+        Err(err) => {
+            eprintln!("control peer addr error: {err}");
+            "<unknown>".to_string()
+        }
+    };
+
+    let mut reader = BufReader::new(stream);
+    loop {
+        let mut line = String::new();
+        let bytes_read = match reader.read_line(&mut line) {
+            Ok(read) => read,
+            Err(err) => {
+                eprintln!("control read error from {peer}: {err}");
+                break;
+            }
+        };
+        if bytes_read == 0 {
+            break;
+        }
+
+        let frame: ControlFrame = match from_json_line(&line) {
+            Ok(frame) => frame,
+            Err(err) => {
+                eprintln!("invalid control frame from {peer}: {err}");
+                continue;
+            }
+        };
+
+        if frame.magic != PROTOCOL_MAGIC {
+            eprintln!("ignoring control frame with invalid magic from {peer}");
+            continue;
+        }
+
+        println!(
+            "Control frame accepted: session={} events={} source={peer}",
+            frame.session_id,
+            frame.events.len()
+        );
     }
 }
 

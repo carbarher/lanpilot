@@ -39,3 +39,11 @@ Expected behavior:
 - agent broadcasts discovery over UDP (`47042`)
 - host responds with identity + handshake endpoint
 - agent opens TCP handshake (`47043`) and receives session ack
+
+### Phase 2 MVP: edge switch + remote input channel
+
+After the handshake succeeds:
+
+- agent evaluates right-edge crossing (`EdgeSwitchConfig`)
+- when edge threshold is reached, agent sends a control frame over TCP (`47044`)
+- host accepts the control frame and logs the remote input event batch

@@ -8,6 +8,7 @@ pub const TAGLINE: &str = "LAN-first remote desktop control";
 pub const PROTOCOL_MAGIC: &str = "LANPILOT_V1";
 pub const DISCOVERY_PORT: u16 = 47042;
 pub const HANDSHAKE_PORT: u16 = 47043;
+pub const CONTROL_PORT: u16 = 47044;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeIdentity {
@@ -81,6 +82,7 @@ pub struct HandshakeAck {
     pub status: String,
     pub host_name: String,
     pub session_id: String,
+    pub control_port: u16,
 }
 
 impl HandshakeAck {
@@ -90,6 +92,77 @@ impl HandshakeAck {
             status: "ok".to_string(),
             host_name: host_name.into(),
             session_id: generate_session_id(),
+            control_port: CONTROL_PORT,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeDirection {
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeSwitchConfig {
+    pub edge: EdgeDirection,
+    pub threshold_px: i32,
+    pub screen_width_px: i32,
+}
+
+impl EdgeSwitchConfig {
+    pub fn right_default(screen_width_px: i32) -> Self {
+        Self {
+            edge: EdgeDirection::Right,
+            threshold_px: 4,
+            screen_width_px,
+        }
+    }
+}
+
+pub fn should_switch_to_remote(cursor_x: i32, config: &EdgeSwitchConfig) -> bool {
+    match config.edge {
+        EdgeDirection::Left => cursor_x <= config.threshold_px,
+        EdgeDirection::Right => cursor_x >= config.screen_width_px - config.threshold_px,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ControlEvent {
+    EdgeSwitch {
+        edge: EdgeDirection,
+        cursor_x: i32,
+        cursor_y: i32,
+    },
+    MouseMove {
+        dx: i32,
+        dy: i32,
+    },
+    MouseButton {
+        button: String,
+        pressed: bool,
+    },
+    Key {
+        key: String,
+        pressed: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlFrame {
+    pub magic: String,
+    pub session_id: String,
+    pub events: Vec<ControlEvent>,
+}
+
+impl ControlFrame {
+    pub fn new(session_id: impl Into<String>, events: Vec<ControlEvent>) -> Self {
+        Self {
+            magic: PROTOCOL_MAGIC.to_string(),
+            session_id: session_id.into(),
+            events,
         }
     }
 }
@@ -157,6 +230,36 @@ mod tests {
     fn handshake_ack_contains_prefix() {
         let ack = HandshakeAck::ok("pc-host");
         assert_eq!(ack.status, "ok");
+        assert_eq!(ack.control_port, CONTROL_PORT);
         assert!(ack.session_id.starts_with("lp-"));
+    }
+
+    #[test]
+    fn should_switch_right_edge_when_threshold_reached() {
+        let config = EdgeSwitchConfig::right_default(1920);
+        assert!(!should_switch_to_remote(1800, &config));
+        assert!(should_switch_to_remote(1918, &config));
+    }
+
+    #[test]
+    fn control_frame_roundtrip_json_line() {
+        let frame = ControlFrame::new(
+            "lp-1",
+            vec![
+                ControlEvent::EdgeSwitch {
+                    edge: EdgeDirection::Right,
+                    cursor_x: 1919,
+                    cursor_y: 540,
+                },
+                ControlEvent::MouseMove { dx: 12, dy: -4 },
+                ControlEvent::MouseButton {
+                    button: "left".to_string(),
+                    pressed: true,
+                },
+            ],
+        );
+        let line = to_json_line(&frame).expect("must serialize control frame");
+        let decoded: ControlFrame = from_json_line(&line).expect("must deserialize control frame");
+        assert_eq!(decoded, frame);
     }
 }

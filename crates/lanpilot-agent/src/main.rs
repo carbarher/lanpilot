@@ -3,8 +3,9 @@ use std::net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
 use std::time::Duration;
 
 use lanpilot_core::{
-    DISCOVERY_PORT, DiscoveryProbe, DiscoveryResponse, HandshakeAck, HandshakeHello, PRODUCT_NAME,
-    PROTOCOL_MAGIC, TAGLINE, from_json_line, to_json_line,
+    ControlEvent, ControlFrame, DISCOVERY_PORT, DiscoveryProbe, DiscoveryResponse, EdgeDirection,
+    EdgeSwitchConfig, HandshakeAck, HandshakeHello, PRODUCT_NAME, PROTOCOL_MAGIC, TAGLINE,
+    from_json_line, should_switch_to_remote, to_json_line,
 };
 
 fn main() -> Result<(), String> {
@@ -25,6 +26,8 @@ fn main() -> Result<(), String> {
         "Handshake OK with host={} session={}",
         ack.host_name, ack.session_id
     );
+
+    run_phase2_input_channel(&discovered.host_ipv4, &ack)?;
 
     Ok(())
 }
@@ -93,4 +96,49 @@ fn perform_handshake(
         return Err(format!("invalid handshake ack payload: {:?}", ack));
     }
     Ok(ack)
+}
+
+fn run_phase2_input_channel(host_ipv4: &str, ack: &HandshakeAck) -> Result<(), String> {
+    let config = EdgeSwitchConfig::right_default(1920);
+    let cursor_x = config.screen_width_px - 1;
+    let cursor_y = 540;
+    if !should_switch_to_remote(cursor_x, &config) {
+        println!("Edge switch not triggered; remote input channel idle.");
+        return Ok(());
+    }
+
+    let frame = ControlFrame::new(
+        ack.session_id.clone(),
+        vec![
+            ControlEvent::EdgeSwitch {
+                edge: EdgeDirection::Right,
+                cursor_x,
+                cursor_y,
+            },
+            ControlEvent::MouseMove { dx: 14, dy: -3 },
+            ControlEvent::MouseButton {
+                button: "left".to_string(),
+                pressed: true,
+            },
+            ControlEvent::MouseButton {
+                button: "left".to_string(),
+                pressed: false,
+            },
+        ],
+    );
+
+    let endpoint = format!("{}:{}", host_ipv4, ack.control_port);
+    let mut stream = TcpStream::connect(endpoint.as_str())
+        .map_err(|err| format!("connect control socket failed: {err}"))?;
+    let encoded =
+        to_json_line(&frame).map_err(|err| format!("encode control frame failed: {err}"))?;
+    stream
+        .write_all(encoded.as_bytes())
+        .map_err(|err| format!("send control frame failed: {err}"))?;
+    println!(
+        "Phase 2: edge-switch triggered, sent {} input events to control channel {}",
+        frame.events.len(),
+        endpoint
+    );
+    Ok(())
 }
