@@ -3,6 +3,7 @@ members = [
     "crates/lanpilot-core",
     "crates/lanpilot-host",
     "crates/lanpilot-agent",
+    "crates/lanpilot-app",
 ]
 resolver = "2"
 
@@ -10,3 +11,6 @@ resolver = "2"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/carbarher/lanpilot"
+
+[patch.crates-io]
+block = { path = "third_party/block-0.1.6" }

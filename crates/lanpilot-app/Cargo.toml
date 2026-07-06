@@ -1,0 +1,15 @@
+[package]
+name = "lanpilot-app"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+
+[dependencies]
+eframe = { version = "0.29", default-features = true }
+egui = "0.29"
+lanpilot-agent = { path = "../lanpilot-agent" }
+lanpilot-core = { path = "../lanpilot-core" }
+lanpilot-host = { path = "../lanpilot-host" }
+
+[build-dependencies]
+winres = "0.1"

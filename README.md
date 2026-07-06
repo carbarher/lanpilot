@@ -12,6 +12,7 @@ LanPilot is a LAN-first remote desktop control project designed to pair naturall
 - `crates/lanpilot-host` - host-side desktop controller entrypoint
 - `crates/lanpilot-agent` - agent-side session/runtime entrypoint
 - `crates/lanpilot-core` - shared domain and protocol primitives
+- `crates/lanpilot-app` - simple Windows GUI wrapper for normal users
 
 ## Quick start
 
@@ -21,6 +22,62 @@ cargo test
 ```
 
 ### Simple flow (for normal users)
+
+#### Simple GUI app
+
+Build everything:
+
+```powershell
+cargo build
+```
+
+Then run the simple app:
+
+```powershell
+cargo run -p lanpilot-app
+```
+
+What normal users see:
+
+- **Compartir mi pantalla** → leaves this PC waiting for incoming connection
+- **Buscar equipos** → lists available PCs by name in the local network
+- **Conexión rápida (1 clic)** → finds and connects automatically to the best available PC
+- **Conectarme** → connects this PC to the selected PC name
+- **Reconectar al último equipo** → quick reconnect to the last successful target
+  (if that PC changed IP, LanPilot tries to recover by PC name)
+- If multiple candidates exist, LanPilot rotates automatically until one responds
+- Candidate rotation uses a fast parallel probe to connect quicker on crowded LANs
+- During connection, LanPilot shows live metrics (discovery/probe/handshake/retry timings)
+- **Diagnóstico** → checks LAN discovery + session hints when connection fails
+- live status text from the in-process background worker
+
+`lanpilot-app` is now a true single executable: it does not need `lanpilot-host.exe`
+or `lanpilot-agent.exe` beside it.
+
+#### Portable package
+
+Build a portable package for normal users:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build-portable.ps1
+```
+
+This creates:
+
+- `dist\LanPilot-Portable\LanPilot.exe`
+- `dist\LanPilot-Portable\LEEME.txt`
+- `dist\LanPilot-Portable.zip`
+- `dist\LanPilot-Portable-checksums.txt`
+- `dist\LanPilot-ReleaseInfo.txt`
+- `dist\LanPilot-Changes.txt`
+- `%USERPROFILE%\Desktop\LanPilot.exe`
+
+Normal users only need to unzip the package and run `LanPilot.exe`.
+
+RDP note:
+
+- LanPilot works better when the remote RDP session is not minimized.
+- Keep the remote session unlocked while sharing screen.
 
 1. On host PC:
 

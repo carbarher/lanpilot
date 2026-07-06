@@ -3,8 +3,16 @@ name = "lanpilot-host"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "lanpilot_host"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lanpilot-host"
+path = "src/main.rs"
+
 [dependencies]
 base64 = "0.22"
 lanpilot-core = { path = "../lanpilot-core" }
 lz4_flex = "0.11"
-scrap = "0.5"
+xcap = "0.9"
