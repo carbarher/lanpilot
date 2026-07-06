@@ -35,7 +35,16 @@ use lanpilot_core::{
     log_session_event, normalize_pair_code, to_json_line, unix_timestamp_ms,
 };
 use lz4_flex::compress_prepend_size;
-use xcap::Monitor;
+
+#[cfg(windows)]
+use windows::Win32::{
+    Graphics::Gdi::{
+        BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC,
+        CreateDCW, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDIBits, HBITMAP, HDC, SelectObject,
+        SRCCOPY,
+    },
+    UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN},
+};
 
 /// Source of frames for the screen-stream channel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -959,25 +968,16 @@ fn initialize_screen_capture(logger: &Logger, max_retries: u32) -> Result<Screen
     ))
 }
 
-/// Screen capturer backed by `xcap` (GDI on Windows by default — works in
-/// console sessions after RDP disconnect, unlike DXGI/WGC).
-struct ScreenCapture {
-    monitor: Monitor,
-}
-
-// xcap::Monitor internally holds a display ID (integer) which is Send-safe.
-// The trait bound is not implemented upstream, so we assert it manually.
-unsafe impl Send for ScreenCapture {}
+/// Screen capturer backed by GDI CreateDC("DISPLAY") — works from any thread,
+/// including background service threads, and survives RDP disconnect/reconnect.
+/// Unlike DXGI/WGC and xcap's GetWindowDC approach, CreateDC does not require
+/// the calling thread to be attached to the interactive desktop window station.
+struct ScreenCapture;
 
 impl ScreenCapture {
     fn new() -> Result<Self, String> {
-        let monitors = Monitor::all().map_err(|e| format!("xcap monitor list error: {e}"))?;
-        let monitor = monitors
-            .into_iter()
-            .find(|m| m.is_primary().unwrap_or(false))
-            .or_else(|| Monitor::all().ok()?.into_iter().next())
-            .ok_or_else(|| "no hay monitores disponibles".to_string())?;
-        Ok(Self { monitor })
+        // Verify the capture path works before committing.
+        Self::capture_bgra().map(|_| Self)
     }
 
     fn capture_frame(
@@ -988,18 +988,7 @@ impl ScreenCapture {
         scale_divisor: u8,
         detect_black_frame: bool,
     ) -> Result<StreamFrame, String> {
-        let img = self
-            .monitor
-            .capture_image()
-            .map_err(|e| format!("screen capture error: {e}"))?;
-        let width = img.width();
-        let height = img.height();
-        // xcap returns RGBA; convert to BGRA for our pipeline.
-        let rgba = img.into_raw();
-        let mut bgra = rgba;
-        for chunk in bgra.chunks_exact_mut(4) {
-            chunk.swap(0, 2); // R <-> B
-        }
+        let (bgra, width, height) = Self::capture_bgra()?;
         let stride_bytes = width as usize * 4;
         let (scaled, out_w, out_h, out_stride) =
             normalize_and_scale_bgra(&bgra, width, height, stride_bytes, scale_divisor);
@@ -1025,6 +1014,108 @@ impl ScreenCapture {
             raw_len: scaled.len(),
             source: "screen".to_string(),
         })
+    }
+
+    /// Capture the primary monitor using GDI CreateDC("DISPLAY").
+    /// Returns raw BGRA pixels (alpha = 255) with (width, height).
+    #[cfg(windows)]
+    fn capture_bgra() -> Result<(Vec<u8>, u32, u32), String> {
+        unsafe {
+            let width = GetSystemMetrics(SM_CXSCREEN);
+            let height = GetSystemMetrics(SM_CYSCREEN);
+            if width <= 0 || height <= 0 {
+                return Err(format!(
+                    "screen capture error: GetSystemMetrics returned {width}x{height}"
+                ));
+            }
+            let w = width as u32;
+            let h = height as u32;
+
+            // CreateDC("DISPLAY") works from any thread — no desktop attachment needed.
+            let hdc_screen: HDC =
+                CreateDCW(&windows::core::HSTRING::from("DISPLAY"), None, None, None);
+            if hdc_screen.is_invalid() {
+                return Err("screen capture error: CreateDC(DISPLAY) failed".to_string());
+            }
+            // Defer cleanup with a simple RAII wrapper via a flag.
+            let _cleanup_screen = DcGuard(hdc_screen);
+
+            let hdc_mem: HDC = CreateCompatibleDC(Some(hdc_screen));
+            if hdc_mem.is_invalid() {
+                return Err("screen capture error: CreateCompatibleDC failed".to_string());
+            }
+            let _cleanup_mem = DcGuard(hdc_mem);
+
+            let hbm: HBITMAP = CreateCompatibleBitmap(hdc_screen, width, height);
+            if hbm.is_invalid() {
+                return Err("screen capture error: CreateCompatibleBitmap failed".to_string());
+            }
+            let _cleanup_bm = BitmapGuard(hbm);
+
+            SelectObject(hdc_mem, hbm.into());
+
+            BitBlt(hdc_mem, 0, 0, width, height, Some(hdc_screen), 0, 0, SRCCOPY)
+                .map_err(|e| format!("screen capture error: BitBlt failed: {e}"))?;
+
+            let buf_size = (w * h * 4) as usize;
+            let mut pixels = vec![0u8; buf_size];
+            let mut bmi = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: width,
+                    biHeight: -height, // negative → top-down DIB
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biSizeImage: buf_size as u32,
+                    biCompression: 0, // BI_RGB
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let rows = GetDIBits(
+                hdc_mem,
+                hbm,
+                0,
+                h,
+                Some(pixels.as_mut_ptr().cast()),
+                &mut bmi,
+                DIB_RGB_COLORS,
+            );
+            if rows == 0 {
+                return Err("screen capture error: GetDIBits returned 0".to_string());
+            }
+
+            // GDI fills 32-bit pixels as BGR0; set alpha = 255 so the frame is opaque.
+            for pixel in pixels.chunks_exact_mut(4) {
+                pixel[3] = 255;
+            }
+            Ok((pixels, w, h))
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn capture_bgra() -> Result<(Vec<u8>, u32, u32), String> {
+        Err("screen capture only supported on Windows".to_string())
+    }
+}
+
+/// RAII guard that calls DeleteDC on drop.
+#[cfg(windows)]
+struct DcGuard(HDC);
+#[cfg(windows)]
+impl Drop for DcGuard {
+    fn drop(&mut self) {
+        unsafe { let _ = DeleteDC(self.0); }
+    }
+}
+
+/// RAII guard that calls DeleteObject on drop.
+#[cfg(windows)]
+struct BitmapGuard(HBITMAP);
+#[cfg(windows)]
+impl Drop for BitmapGuard {
+    fn drop(&mut self) {
+        unsafe { let _ = DeleteObject(self.0.into()); }
     }
 }
 
