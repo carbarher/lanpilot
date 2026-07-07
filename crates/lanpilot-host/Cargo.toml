@@ -14,6 +14,7 @@ lanpilot-core = { path = "../lanpilot-core" }
 lz4_flex = "0.11"
 arboard = "3.6"
 cpal = "0.15"
+twox-hash = "2.1"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [

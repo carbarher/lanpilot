@@ -1038,6 +1038,15 @@ fn run_phase3_stream_channel(
                     last_middle_down = middle_down;
                 }
 
+                if let Some((scroll_x, scroll_y)) = r.window.get_scroll_wheel() {
+                    if scroll_x.abs() > 0.0 || scroll_y.abs() > 0.0 {
+                        let _ = input_tx.send(ControlEvent::MouseScroll {
+                            dx: (scroll_x * 120.0) as i32,
+                            dy: (scroll_y * 120.0) as i32,
+                        });
+                    }
+                }
+
                 let current_keys = r.window.get_keys();
                 let current_keys_set: std::collections::HashSet<minifb::Key> = current_keys.iter().cloned().collect();
                 for k in &current_keys_set {

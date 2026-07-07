@@ -366,6 +366,10 @@ pub enum ControlEvent {
     ClipboardFiles {
         paths_b64: String, // Lista de paths codificada en Base64 para compatibilidad
     },
+    MouseScroll {
+        dx: i32,
+        dy: i32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

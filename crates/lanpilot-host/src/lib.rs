@@ -1012,6 +1012,17 @@ fn handle_control_stream(
                     send_mouse_input(0x0001, *dx, *dy, 0);
                 }
             }
+            if let ControlEvent::MouseScroll { dx, dy } = event {
+                #[cfg(windows)]
+                {
+                    if *dy != 0 {
+                        send_mouse_input(0x0800, 0, 0, *dy as u32); // MOUSEEVENTF_WHEEL = 0x0800
+                    }
+                    if *dx != 0 {
+                        send_mouse_input(0x01000, 0, 0, *dx as u32); // MOUSEEVENTF_HWHEEL = 0x01000
+                    }
+                }
+            }
             if let ControlEvent::CycleMonitor = event {
                 let monitors = get_connected_monitors();
                 let total_monitors = monitors.len();
@@ -2160,11 +2171,12 @@ impl ScreenCapture {
                     }
                 }
 
-                let mut hash = 2166136261_u64;
-                for &b in &tile_bytes {
-                    hash = hash ^ (b as u64);
-                    hash = hash.wrapping_mul(16777619);
-                }
+                let hash = {
+                    use std::hash::Hasher;
+                    let mut hasher = twox_hash::XxHash64::default();
+                    hasher.write(&tile_bytes);
+                    hasher.finish()
+                };
 
                 let idx = row * cols + col;
                 if force_full_frame || self.last_tile_hashes[idx] != hash {
