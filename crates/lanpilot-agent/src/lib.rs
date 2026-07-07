@@ -18,6 +18,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
+use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -741,11 +742,16 @@ fn run_phase3_stream_channel(
         .set_read_timeout(Some(Duration::from_secs(2)))
         .map_err(|err| format!("set stream read timeout failed: {err}"))?;
 
+    let mut stream_cipher_rx = lanpilot_core::Rc4Cipher::new(format!("{}-stream-h2c", config.pair_code).as_bytes());
+    let mut stream_cipher_tx = lanpilot_core::Rc4Cipher::new(format!("{}-stream-c2h", config.pair_code).as_bytes());
+
     let hello = StreamHello::new(ack.session_id.clone(), agent_name.to_string());
     let hello_line =
         to_json_line(&hello).map_err(|err| format!("encode stream hello failed: {err}"))?;
+    
+    let encrypted_hello = lanpilot_core::encrypt_line(&hello_line, &mut stream_cipher_tx);
     stream
-        .write_all(hello_line.as_bytes())
+        .write_all(encrypted_hello.as_bytes())
         .map_err(|err| format!("send stream hello failed: {err}"))?;
 
     let mut reader = BufReader::new(stream);
@@ -761,12 +767,18 @@ fn run_phase3_stream_channel(
         .set_write_timeout(Some(Duration::from_secs(5)))
         .map_err(|err| format!("set control write timeout failed: {err}"))?;
 
-    spawn_audio_client(host_ipv4.to_string(), stop.clone(), logger.clone());
+    let control_cipher_tx = lanpilot_core::Rc4Cipher::new(format!("{}-control-c2h", config.pair_code).as_bytes());
+    let control_tx_mutex = Arc::new(std::sync::Mutex::new((control_stream.try_clone().unwrap(), control_cipher_tx)));
+
+    spawn_audio_client(host_ipv4.to_string(), stop.clone(), logger.clone(), config.pair_code.clone());
 
     let mut received = 0_u32;
+    #[allow(unused_variables)]
     let mut black_filtered = 0_u32;
     let mut timeout_streak = 0_u32;
+    #[allow(unused_variables)]
     let mut last_sequence = 0_u64;
+    #[allow(unused_variables)]
     let mut total_raw = 0_usize;
     let mut last_feedback: Option<(u32, u8)> = None;
     let mut black_filter_logged = false;
@@ -775,7 +787,10 @@ fn run_phase3_stream_channel(
     let mut last_captured_at_ms = 0_u64;
     let mut use_rgb565 = false;
     let mut last_clipboard_image_hash: Option<u64> = None;
+    let mut last_html_hash: Option<u64> = None;
+    let mut last_rtf_hash: Option<u64> = None;
     let mut last_clipboard_image_check = std::time::Instant::now();
+    let mut last_quality_adjustment = std::time::Instant::now();
     let mut privacy_mode_active = false;
     let mut last_frame_received_at = std::time::Instant::now();
     let mut local_clipboard = arboard::Clipboard::new().ok();
@@ -790,10 +805,13 @@ fn run_phase3_stream_channel(
 
     let stop_render = stop.clone();
     let logger_render = logger.clone();
+    let input_tx_render = input_tx.clone();
     
     let _render_thread = std::thread::spawn(move || {
+        let input_tx = input_tx_render;
         let mut renderer: Option<FrameRenderer> = None;
         let mut last_mouse_pos: Option<(f32, f32)> = None;
+        let mut edge_touch_start: Option<std::time::Instant> = None;
         let mut last_left_down = false;
         let mut last_right_down = false;
         let mut last_middle_down = false;
@@ -927,8 +945,19 @@ fn run_phase3_stream_channel(
                     if let Some((mx, my)) = r.window.get_mouse_pos(minifb::MouseMode::Discard) {
                         let current_pos = (mx, my);
                         if last_mouse_pos != Some(current_pos) {
-                            let _ = input_tx.send(ControlEvent::MouseMove { dx: mx as i32, dy: my as i32 });
-                            last_mouse_pos = Some(current_pos);
+                            let is_at_edge = mx <= 2.0 || mx >= (r.width as f32 - 3.0) || my <= 2.0 || my >= (r.height as f32 - 3.0);
+                            if is_at_edge {
+                                if edge_touch_start.is_none() {
+                                    edge_touch_start = Some(std::time::Instant::now());
+                                } else if edge_touch_start.unwrap().elapsed() >= std::time::Duration::from_millis(150) {
+                                    let _ = input_tx.send(ControlEvent::MouseMove { dx: mx as i32, dy: my as i32 });
+                                    last_mouse_pos = Some(current_pos);
+                                }
+                            } else {
+                                edge_touch_start = None;
+                                let _ = input_tx.send(ControlEvent::MouseMove { dx: mx as i32, dy: my as i32 });
+                                last_mouse_pos = Some(current_pos);
+                            }
                         }
                     }
                 }
@@ -1027,6 +1056,18 @@ fn run_phase3_stream_channel(
         }
     };
 
+    let send_control_event = {
+        let tx_mutex = Arc::clone(&control_tx_mutex);
+        use std::io::Write;
+        move |frame: &lanpilot_core::ControlFrame| {
+            if let Ok(line) = to_json_line(frame) {
+                let mut guard = tx_mutex.lock().unwrap();
+                let encrypted = lanpilot_core::encrypt_line(&line, &mut guard.1);
+                let _ = guard.0.write_all(encrypted.as_bytes());
+            }
+        }
+    };
+
     while target_frames == 0 || received < target_frames {
         if is_stopped(stop) {
             logger.log("Transmisión cancelada por el usuario.".to_string());
@@ -1040,26 +1081,24 @@ fn run_phase3_stream_channel(
                     logger.log(format!("Solicitando alternar Modo Privacidad en Host (Activo={}).", privacy_mode_active));
                     let ev = ControlEvent::TogglePrivacyMode { enabled: privacy_mode_active };
                     let control_frame = ControlFrame::new(ack.session_id.clone(), vec![ev]);
-                    if let Ok(line) = to_json_line(&control_frame) {
-                        let _ = control_stream.write_all(line.as_bytes());
-                    }
+                    send_control_event(&control_frame);
                 }
                 ControlEvent::SetVideoFormat { .. } => {
                     use_rgb565 = !use_rgb565;
                     logger.log(format!("Solicitando cambio de formato de video (use_rgb565={}).", use_rgb565));
                     let ev = ControlEvent::SetVideoFormat { use_rgb565 };
                     let control_frame = ControlFrame::new(ack.session_id.clone(), vec![ev]);
-                    if let Ok(line) = to_json_line(&control_frame) {
-                        let _ = control_stream.write_all(line.as_bytes());
-                    }
+                    send_control_event(&control_frame);
                 }
                 ControlEvent::FileChunk { filename, .. } if filename == "trigger_select_file" => {
                     logger.log("Abriendo selector de archivos para transferencia remota (Ctrl + Alt + F)...".to_string());
                     let control_stream_clone = control_stream.try_clone().ok();
                     let session_id = ack.session_id.clone();
                     let logger_thread = logger.clone();
+                    let tx_mutex_clone = Arc::clone(&control_tx_mutex);
+                    let pair_code_clone = config.pair_code.clone();
                     std::thread::spawn(move || {
-                        let Some(mut stream) = control_stream_clone else { return; };
+                        let Some(stream) = control_stream_clone else { return; };
                         let mut reader_stream = match stream.try_clone() {
                             Ok(s) => std::io::BufReader::new(s),
                             Err(_) => return,
@@ -1094,6 +1133,7 @@ fn run_phase3_stream_channel(
                                 const WINDOW_SIZE: usize = 6;
                                 
                                 let _ = reader_stream.get_ref().set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                                let mut file_cipher_rx = lanpilot_core::Rc4Cipher::new(format!("{}-control-h2c", pair_code_clone).as_bytes());
 
                                 loop {
                                     while in_flight.len() < WINDOW_SIZE {
@@ -1109,7 +1149,9 @@ fn run_phase3_stream_channel(
                                                 };
                                                 let control_frame = ControlFrame::new(session_id.clone(), vec![event]);
                                                 if let Ok(line) = to_json_line(&control_frame) {
-                                                    let _ = stream.write_all(line.as_bytes());
+                                                    let mut guard = tx_mutex_clone.lock().unwrap();
+                                                    let encrypted = lanpilot_core::encrypt_line(&line, &mut guard.1);
+                                                    let _ = guard.0.write_all(encrypted.as_bytes());
                                                 }
                                                 in_flight.push_back((offset, n as u64));
                                                 offset += n as u64;
@@ -1129,15 +1171,17 @@ fn run_phase3_stream_channel(
                                             return;
                                         }
                                         Ok(_) => {
-                                            if let Ok(frame) = from_json_line::<ControlFrame>(&ack_line) {
-                                                for ev in frame.events {
-                                                    if let ControlEvent::FileChunkAck { offset: ack_offset, .. } = ev {
-                                                        while let Some(&(off, size)) = in_flight.front() {
-                                                            if off <= ack_offset {
-                                                                acked_offset = off + size;
-                                                                in_flight.pop_front();
-                                                            } else {
-                                                                break;
+                                            if let Ok(decrypted) = lanpilot_core::decrypt_line(&ack_line, &mut file_cipher_rx) {
+                                                if let Ok(frame) = from_json_line::<ControlFrame>(&decrypted) {
+                                                    for ev in frame.events {
+                                                        if let ControlEvent::FileChunkAck { offset: ack_offset, .. } = ev {
+                                                            while let Some(&(off, size)) = in_flight.front() {
+                                                                if off <= ack_offset {
+                                                                    acked_offset = off + size;
+                                                                    in_flight.pop_front();
+                                                                } else {
+                                                                    break;
+                                                                }
                                                             }
                                                         }
                                                     }
@@ -1239,10 +1283,60 @@ fn run_phase3_stream_channel(
         last_frame_received_at = std::time::Instant::now();
         timeout_streak = 0;
 
+        let decrypted_line = match lanpilot_core::decrypt_line(&line, &mut stream_cipher_rx) {
+            Ok(d) => d,
+            Err(err) => {
+                logger.log(format!("stream decrypt error: {err}"));
+                continue;
+            }
+        };
+
         let frame: StreamFrame =
-            from_json_line(&line).map_err(|err| format!("decode stream frame failed: {err}"))?;
+            from_json_line(&decrypted_line).map_err(|err| format!("decode stream frame failed: {err}"))?;
         if frame.magic != PROTOCOL_MAGIC || frame.session_id != ack.session_id {
             return Err(format!("invalid stream frame payload: {:?}", frame));
+        }
+
+        let now_ms = unix_timestamp_ms();
+        if frame.captured_at_ms > 0 && now_ms >= frame.captured_at_ms {
+            let frame_latency = now_ms.saturating_sub(frame.captured_at_ms);
+            if last_quality_adjustment.elapsed() >= std::time::Duration::from_secs(2) {
+                if frame_latency > 100 {
+                    let _ = input_tx.send(ControlEvent::ReduceQuality);
+                    last_quality_adjustment = std::time::Instant::now();
+                } else if frame_latency < 30 {
+                    let _ = input_tx.send(ControlEvent::IncreaseQuality);
+                    last_quality_adjustment = std::time::Instant::now();
+                }
+            }
+        }
+
+        if frame.source == "clipboard_rich" {
+            if let Ok(compressed) = BASE64.decode(&frame.compressed_payload_b64) {
+                if let Ok(decompressed) = lz4_flex::decompress_size_prepended(&compressed) {
+                    let fmt_name = if frame.pixel_format == "html" { "HTML Format" } else { "Rich Text Format" };
+                    #[cfg(windows)]
+                    {
+                        let _ = lanpilot_core::write_rich_clipboard(fmt_name, &decompressed);
+                        let hash = {
+                            let mut h = decompressed.len() as u64;
+                            if !decompressed.is_empty() {
+                                h = h.wrapping_add(decompressed[0] as u64);
+                                h = h.wrapping_add(decompressed[decompressed.len() / 2] as u64);
+                                h = h.wrapping_add(decompressed[decompressed.len() - 1] as u64);
+                            }
+                            h
+                        };
+                        if fmt_name == "HTML Format" {
+                            last_html_hash = Some(hash);
+                        } else {
+                            last_rtf_hash = Some(hash);
+                        }
+                        logger.log(format!("Portapapeles rico '{}' sincronizado desde host remoto: {} bytes", fmt_name, decompressed.len()));
+                    }
+                }
+            }
+            continue;
         }
 
         if frame.source == "clipboard" {
@@ -1266,9 +1360,7 @@ fn run_phase3_stream_channel(
         if frame.source == "ping" {
             let response = ControlEvent::Pong { timestamp_ms: frame.captured_at_ms as u64 };
             let control_frame = ControlFrame::new(ack.session_id.clone(), vec![response]);
-            if let Ok(line) = to_json_line(&control_frame) {
-                let _ = control_stream.write_all(line.as_bytes());
-            }
+            send_control_event(&control_frame);
             continue;
         }
 
@@ -1443,7 +1535,7 @@ fn run_phase3_stream_channel(
             if last_feedback != Some((target_fps, scale_divisor)) {
                 last_feedback = Some((target_fps, scale_divisor));
                 let _ = send_stream_feedback(
-                    &mut control_stream,
+                    &control_tx_mutex,
                     ack,
                     &summary,
                     target_fps,
@@ -1460,10 +1552,8 @@ fn run_phase3_stream_channel(
                             ack.session_id.clone(),
                             vec![ControlEvent::Clipboard { text: text_trimmed.clone() }],
                         );
-                        if let Ok(line) = to_json_line(&clipboard_frame) {
-                            let _ = control_stream.write_all(line.as_bytes());
-                            last_sent_clipboard = text_trimmed;
-                        }
+                        send_control_event(&clipboard_frame);
+                        last_sent_clipboard = text_trimmed;
                     }
                 }
                 
@@ -1493,8 +1583,43 @@ fn run_phase3_stream_channel(
                                     rgba_payload_b64: encoded,
                                 }],
                             );
-                            if let Ok(line) = to_json_line(&clipboard_img_frame) {
-                                  let _ = control_stream.write_all(line.as_bytes());
+                            send_control_event(&clipboard_img_frame);
+                        }
+                    }
+
+                    // Sincronización de Portapapeles Enriquecido (HTML y RTF)
+                    #[cfg(windows)]
+                    {
+                        for fmt in &["HTML Format", "Rich Text Format"] {
+                            if let Some(data) = lanpilot_core::read_rich_clipboard(fmt) {
+                                let hash = {
+                                    let mut h = data.len() as u64;
+                                    if !data.is_empty() {
+                                        h = h.wrapping_add(data[0] as u64);
+                                        h = h.wrapping_add(data[data.len() / 2] as u64);
+                                        h = h.wrapping_add(data[data.len() - 1] as u64);
+                                    }
+                                    h
+                                };
+                                let is_new = match fmt {
+                                    &"HTML Format" => last_html_hash != Some(hash),
+                                    &"Rich Text Format" => last_rtf_hash != Some(hash),
+                                    _ => false,
+                                };
+                                if is_new {
+                                    if fmt == &"HTML Format" { last_html_hash = Some(hash); }
+                                    else { last_rtf_hash = Some(hash); }
+                                    
+                                    let encoded = BASE64.encode(&data);
+                                    let rich_frame = ControlFrame::new(
+                                        ack.session_id.clone(),
+                                        vec![ControlEvent::ClipboardRichText {
+                                            format: fmt.to_string(),
+                                            payload_b64: encoded,
+                                        }],
+                                    );
+                                    send_control_event(&rich_frame);
+                                }
                             }
                         }
                     }
@@ -1606,7 +1731,7 @@ fn choose_adaptive_target(summary: &StreamSummary) -> (u32, u8) {
 }
 
 fn send_stream_feedback(
-    control: &mut TcpStream,
+    tx_mutex: &Arc<std::sync::Mutex<(TcpStream, lanpilot_core::Rc4Cipher)>>,
     ack: &HandshakeAck,
     summary: &StreamSummary,
     target_fps: u32,
@@ -1625,8 +1750,12 @@ fn send_stream_feedback(
     );
     let encoded =
         to_json_line(&feedback).map_err(|err| format!("encode feedback frame failed: {err}"))?;
-    control
-        .write_all(encoded.as_bytes())
+    
+    let mut guard = tx_mutex.lock().unwrap();
+    let encrypted = lanpilot_core::encrypt_line(&encoded, &mut guard.1);
+    use std::io::Write;
+    guard.0
+        .write_all(encrypted.as_bytes())
         .map_err(|err| format!("send feedback frame failed: {err}"))?;
     Ok(())
 }
@@ -2012,7 +2141,7 @@ struct StreamSummary {
     jitter_ms: f64,
 }
 
-fn spawn_audio_client(host_ipv4: String, stop: StopFlag, logger: Logger) {
+fn spawn_audio_client(host_ipv4: String, stop: StopFlag, logger: Logger, pair_code: String) {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     use std::net::TcpStream;
     use std::sync::{Arc, Mutex};
@@ -2187,6 +2316,8 @@ fn spawn_audio_client(host_ipv4: String, stop: StopFlag, logger: Logger) {
         let mut predictor = 0;
         let mut step_index = 0;
 
+        let mut cipher_rx = lanpilot_core::Rc4Cipher::new(format!("{}-audio-h2c", pair_code).as_bytes());
+
         if use_compression {
             let _ = stream.set_nonblocking(false);
             let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
@@ -2206,6 +2337,8 @@ fn spawn_audio_client(host_ipv4: String, stop: StopFlag, logger: Logger) {
                     logger.log(format!("Error leyendo payload de audio comprimido: {e}"));
                     break;
                 }
+                
+                cipher_rx.crypt(&mut compressed_data);
                 
                 if let Ok(decompressed) = decompress_size_prepended(&compressed_data) {
                     let mut buffer = audio_buffer.lock().unwrap();

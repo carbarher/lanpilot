@@ -1980,6 +1980,7 @@ dependencies = [
 name = "lanpilot-core"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "rand",
  "serde",
  "serde_json",

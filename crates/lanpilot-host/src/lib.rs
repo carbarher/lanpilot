@@ -351,6 +351,7 @@ pub fn run_host(config: HostConfig, logger: Logger, stop: StopFlag) -> Result<()
         let control_clipboard = Arc::clone(&last_sync_clipboard);
         let active_rect = Arc::clone(&active_capture_rect);
         let monitor_idx = Arc::clone(&active_monitor_index);
+        let code_clone = pair_code.clone();
         handles.push(thread::spawn(move || {
             run_control_server(
                 control_listener,
@@ -362,6 +363,7 @@ pub fn run_host(config: HostConfig, logger: Logger, stop: StopFlag) -> Result<()
                 control_clipboard,
                 active_rect,
                 monitor_idx,
+                code_clone,
             )
         }));
     }
@@ -375,6 +377,7 @@ pub fn run_host(config: HostConfig, logger: Logger, stop: StopFlag) -> Result<()
         let stream_clipboard = Arc::clone(&last_sync_clipboard);
         let active_rect = Arc::clone(&active_capture_rect);
         let monitor_idx = Arc::clone(&active_monitor_index);
+        let code_clone = pair_code.clone();
         handles.push(thread::spawn(move || {
             run_stream_server(
                 stream_listener,
@@ -388,6 +391,7 @@ pub fn run_host(config: HostConfig, logger: Logger, stop: StopFlag) -> Result<()
                 stream_clipboard,
                 active_rect,
                 monitor_idx,
+                code_clone,
             )
         }));
     }
@@ -403,8 +407,9 @@ pub fn run_host(config: HostConfig, logger: Logger, stop: StopFlag) -> Result<()
     {
         let logger = logger.clone();
         let stop = Arc::clone(&stop);
+        let code_clone = pair_code.clone();
         handles.push(thread::spawn(move || {
-            run_audio_server(audio_listener, logger, stop)
+            run_audio_server(audio_listener, logger, stop, code_clone)
         }));
     }
 
@@ -586,6 +591,7 @@ fn run_control_server(
     last_sync_clipboard: Arc<Mutex<String>>,
     active_capture_rect: Arc<Mutex<(i32, i32, i32, i32)>>,
     active_monitor_index: Arc<std::sync::atomic::AtomicUsize>,
+    pair_code: String,
 ) {
     if let Err(err) = listener.set_nonblocking(true) {
         logger.log(format!("control set_nonblocking error: {err}"));
@@ -635,6 +641,7 @@ fn run_control_server(
         let clipboard_clone = Arc::clone(&last_sync_clipboard);
         let active_rect = Arc::clone(&active_capture_rect);
         let monitor_idx = Arc::clone(&active_monitor_index);
+        let code_clone = pair_code.clone();
         thread::spawn(move || {
             let _permit = permit;
             handle_control_stream(
@@ -646,6 +653,7 @@ fn run_control_server(
                 clipboard_clone,
                 active_rect,
                 monitor_idx,
+                code_clone,
             )
         });
     }
@@ -678,6 +686,7 @@ fn handle_control_stream(
     last_sync_clipboard: Arc<Mutex<String>>,
     active_capture_rect: Arc<Mutex<(i32, i32, i32, i32)>>,
     active_monitor_index: Arc<std::sync::atomic::AtomicUsize>,
+    pair_code: String,
 ) {
     let peer = match stream.peer_addr() {
         Ok(addr) => addr.to_string(),
@@ -686,6 +695,9 @@ fn handle_control_stream(
             "<unknown>".to_string()
         }
     };
+
+    let mut cipher_rx = lanpilot_core::Rc4Cipher::new(format!("{}-control-c2h", pair_code).as_bytes());
+    let mut cipher_tx = lanpilot_core::Rc4Cipher::new(format!("{}-control-h2c", pair_code).as_bytes());
 
     // Short timeout so the loop can notice the stop flag promptly; silence on
     // the control channel during stable streaming is expected and not an error.
@@ -701,6 +713,8 @@ fn handle_control_stream(
     let mut writer = reader.get_ref().try_clone().ok();
 
     let mut last_clipboard_image_hash: Option<u64> = None;
+    let mut last_html_hash: Option<u64> = None;
+    let mut last_rtf_hash: Option<u64> = None;
     let mut last_clipboard_image_check = Instant::now();
     let mut last_ping_sent = Instant::now();
     let mut pings_unanswered = 0;
@@ -721,7 +735,8 @@ fn handle_control_stream(
                 let event = ControlEvent::Ping { timestamp_ms: unix_timestamp_ms() as u64 };
                 let control_frame = ControlFrame::new("ping-frame".to_string(), vec![event]);
                 if let Ok(line) = to_json_line(&control_frame) {
-                    let _ = w.write_all(line.as_bytes());
+                    let encrypted = lanpilot_core::encrypt_line(&line, &mut cipher_tx);
+                    let _ = w.write_all(encrypted.as_bytes());
                 }
             }
         }
@@ -776,7 +791,51 @@ fn handle_control_stream(
                             let control_frame = ControlFrame::new("clipboard-image".to_string(), vec![event]);
                             if let Ok(line) = to_json_line(&control_frame) {
                                 use std::io::Write;
-                                let _ = w.write_all(line.as_bytes());
+                                let encrypted = lanpilot_core::encrypt_line(&line, &mut cipher_tx);
+                                let _ = w.write_all(encrypted.as_bytes());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2b. Sincronización de Portapapeles Enriquecido (HTML y RTF) cada 1.5 segundos
+        #[cfg(windows)]
+        {
+            if now.duration_since(last_clipboard_image_check) >= Duration::from_millis(1500) {
+                if let Some(ref mut w) = writer {
+                    for fmt in &["HTML Format", "Rich Text Format"] {
+                        if let Some(data) = lanpilot_core::read_rich_clipboard(fmt) {
+                            let hash = {
+                                let mut h = data.len() as u64;
+                                if !data.is_empty() {
+                                    h = h.wrapping_add(data[0] as u64);
+                                    h = h.wrapping_add(data[data.len() / 2] as u64);
+                                    h = h.wrapping_add(data[data.len() - 1] as u64);
+                                }
+                                h
+                            };
+                            let is_new = match fmt {
+                                &"HTML Format" => last_html_hash != Some(hash),
+                                &"Rich Text Format" => last_rtf_hash != Some(hash),
+                                _ => false,
+                            };
+                            if is_new {
+                                if fmt == &"HTML Format" { last_html_hash = Some(hash); }
+                                else { last_rtf_hash = Some(hash); }
+                                
+                                let encoded = BASE64.encode(&data);
+                                let event = ControlEvent::ClipboardRichText {
+                                    format: fmt.to_string(),
+                                    payload_b64: encoded,
+                                };
+                                let control_frame = ControlFrame::new("clipboard-rich".to_string(), vec![event]);
+                                if let Ok(line) = to_json_line(&control_frame) {
+                                    use std::io::Write;
+                                    let encrypted = lanpilot_core::encrypt_line(&line, &mut cipher_tx);
+                                    let _ = w.write_all(encrypted.as_bytes());
+                                }
                             }
                         }
                     }
@@ -797,7 +856,15 @@ fn handle_control_stream(
             break;
         }
 
-        let frame: ControlFrame = match from_json_line(&line) {
+        let decrypted_line = match lanpilot_core::decrypt_line(&line, &mut cipher_rx) {
+            Ok(d) => d,
+            Err(err) => {
+                logger.log(format!("control decrypt error from {peer}: {err}"));
+                continue;
+            }
+        };
+
+        let frame: ControlFrame = match from_json_line(&decrypted_line) {
             Ok(frame) => frame,
             Err(err) => {
                 logger.log(format!("invalid control frame from {peer}: {err}"));
@@ -857,6 +924,47 @@ fn handle_control_stream(
                     ));
                     guard.target_fps = next_fps;
                     guard.scale_divisor = next_scale;
+                }
+            }
+            if let ControlEvent::ClipboardRichText { format, payload_b64 } = event {
+                if let Ok(decoded) = BASE64.decode(payload_b64) {
+                    #[cfg(windows)]
+                    {
+                        let _ = lanpilot_core::write_rich_clipboard(format, &decoded);
+                        let hash = {
+                            let mut h = decoded.len() as u64;
+                            if !decoded.is_empty() {
+                                h = h.wrapping_add(decoded[0] as u64);
+                                h = h.wrapping_add(decoded[decoded.len() / 2] as u64);
+                                h = h.wrapping_add(decoded[decoded.len() - 1] as u64);
+                            }
+                            h
+                        };
+                        if format == "HTML Format" {
+                            last_html_hash = Some(hash);
+                        } else if format == "Rich Text Format" {
+                            last_rtf_hash = Some(hash);
+                        }
+                        logger.log(format!("Sincronización de portapapeles enriquecido: escrito '{}' ({} bytes)", format, decoded.len()));
+                    }
+                }
+            }
+            if let ControlEvent::ReduceQuality = event {
+                if let Ok(mut guard) = tuning.lock() {
+                    let old_scale = guard.scale_divisor;
+                    guard.scale_divisor = (guard.scale_divisor + 1).min(3);
+                    if guard.scale_divisor != old_scale {
+                        logger.log(format!("Calibración dinámica de calidad: incrementando divisor a {}", guard.scale_divisor));
+                    }
+                }
+            }
+            if let ControlEvent::IncreaseQuality = event {
+                if let Ok(mut guard) = tuning.lock() {
+                    let old_scale = guard.scale_divisor;
+                    guard.scale_divisor = (guard.scale_divisor - 1).max(1);
+                    if guard.scale_divisor != old_scale {
+                        logger.log(format!("Calibración dinámica de calidad: reduciendo divisor a {}", guard.scale_divisor));
+                    }
                 }
             }
             if let ControlEvent::Clipboard { text } = event {
@@ -1022,7 +1130,8 @@ fn handle_control_stream(
                                     let control_frame = ControlFrame::new(frame.session_id.clone(), vec![ack_event]);
                                     if let Ok(line) = to_json_line(&control_frame) {
                                         use std::io::Write;
-                                        let _ = w.write_all(line.as_bytes());
+                                        let encrypted = lanpilot_core::encrypt_line(&line, &mut cipher_tx);
+                                        let _ = w.write_all(encrypted.as_bytes());
                                     }
                                 }
                             }
@@ -1120,6 +1229,7 @@ fn run_stream_server(
     last_sync_clipboard: Arc<Mutex<String>>,
     active_capture_rect: Arc<Mutex<(i32, i32, i32, i32)>>,
     active_monitor_index: Arc<std::sync::atomic::AtomicUsize>,
+    pair_code: String,
 ) {
     if let Err(err) = listener.set_nonblocking(true) {
         logger.log(format!("stream set_nonblocking error: {err}"));
@@ -1190,6 +1300,7 @@ fn run_stream_server(
         let clipboard_clone = Arc::clone(&last_sync_clipboard);
         let active_rect = Arc::clone(&active_capture_rect);
         let monitor_idx = Arc::clone(&active_monitor_index);
+        let code_clone = pair_code.clone();
         thread::spawn(move || {
             let _permit = permit;
             if let Err(err) = handle_stream_channel(
@@ -1204,6 +1315,7 @@ fn run_stream_server(
                 clipboard_clone,
                 active_rect,
                 monitor_idx,
+                code_clone,
             ) {
                 logger_conn.log(format!("stream channel error: {err}"));
             }
@@ -1229,6 +1341,7 @@ fn handle_stream_channel(
     last_sync_clipboard: Arc<Mutex<String>>,
     active_capture_rect: Arc<Mutex<(i32, i32, i32, i32)>>,
     active_monitor_index: Arc<std::sync::atomic::AtomicUsize>,
+    pair_code: String,
 ) -> Result<(), String> {
     let peer = stream
         .peer_addr()
@@ -1247,11 +1360,18 @@ fn handle_stream_channel(
             .map_err(|err| format!("stream clone error: {err}"))?,
     );
 
+    let mut cipher_rx = lanpilot_core::Rc4Cipher::new(format!("{}-stream-c2h", pair_code).as_bytes());
+    let mut cipher_tx = lanpilot_core::Rc4Cipher::new(format!("{}-stream-h2c", pair_code).as_bytes());
+
     let mut hello_line = String::new();
     std::io::BufRead::read_line(&mut reader, &mut hello_line)
         .map_err(|err| format!("stream read hello failed: {err}"))?;
+    
+    let decrypted_hello = lanpilot_core::decrypt_line(&hello_line, &mut cipher_rx)
+        .map_err(|err| format!("stream hello decrypt failed: {err}"))?;
+
     let hello: StreamHello =
-        from_json_line(&hello_line).map_err(|err| format!("invalid stream hello: {err}"))?;
+        from_json_line(&decrypted_hello).map_err(|err| format!("invalid stream hello: {err}"))?;
     if hello.magic != PROTOCOL_MAGIC || hello.role != "agent" {
         return Err(format!("invalid stream hello payload: {:?}", hello));
     }
@@ -1605,7 +1725,8 @@ fn handle_stream_channel(
                 tiles: None,
             };
             if let Ok(line) = to_json_line(&ping_frame) {
-                if let Err(_) = stream.write_all(line.as_bytes()) {
+                let encrypted = lanpilot_core::encrypt_line(&line, &mut cipher_tx);
+                if let Err(_) = stream.write_all(encrypted.as_bytes()) {
                     break;
                 }
             }
@@ -1648,7 +1769,8 @@ fn handle_stream_channel(
                             tiles: None,
                         };
                         if let Ok(line) = to_json_line(&cb_img_frame) {
-                            if let Err(_) = stream.write_all(line.as_bytes()) {
+                            let encrypted = lanpilot_core::encrypt_line(&line, &mut cipher_tx);
+                            if let Err(_) = stream.write_all(encrypted.as_bytes()) {
                                 break;
                             }
                         }
@@ -1686,7 +1808,8 @@ fn handle_stream_channel(
                         tiles: None,
                     };
                     if let Ok(line) = to_json_line(&cb_frame) {
-                        if let Err(_) = stream.write_all(line.as_bytes()) {
+                        let encrypted = lanpilot_core::encrypt_line(&line, &mut cipher_tx);
+                        if let Err(_) = stream.write_all(encrypted.as_bytes()) {
                             break;
                         }
                     }
@@ -1704,7 +1827,8 @@ fn handle_stream_channel(
                     frame = next_frame;
                 }
                 if let Ok(encoded) = to_json_line(&frame) {
-                    if let Err(err) = stream.write_all(encoded.as_bytes()) {
+                    let encrypted = lanpilot_core::encrypt_line(&encoded, &mut cipher_tx);
+                    if let Err(err) = stream.write_all(encrypted.as_bytes()) {
                         if matches!(
                             err.kind(),
                             std::io::ErrorKind::BrokenPipe
@@ -2506,6 +2630,7 @@ fn run_audio_server(
     listener: std::net::TcpListener,
     logger: Logger,
     stop: StopFlag,
+    pair_code: String,
 ) {
     logger.log("Servidor de audio iniciado. Esperando conexión del agente...".to_string());
     let _ = listener.set_nonblocking(true);
@@ -2517,9 +2642,10 @@ fn run_audio_server(
                 logger.log(format!("Agente conectado para audio desde {}", addr));
                 let logger = logger.clone();
                 let stop = Arc::clone(&stop);
+                let code_clone = pair_code.clone();
                 
                 std::thread::spawn(move || {
-                    if let Err(err) = handle_audio_stream(&mut stream, &logger, stop) {
+                    if let Err(err) = handle_audio_stream(&mut stream, &logger, stop, code_clone) {
                         logger.log(format!("Error en sesión de audio: {}", err));
                     }
                     logger.log("Sesión de audio finalizada.".to_string());
@@ -2540,6 +2666,7 @@ fn handle_audio_stream(
     stream: &mut std::net::TcpStream,
     logger: &Logger,
     stop: StopFlag,
+    pair_code: String,
 ) -> Result<(), String> {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     use std::io::Write;
@@ -2642,6 +2769,8 @@ fn handle_audio_stream(
         _ => return Err("Formato de audio no soportado".to_string()),
     }.map_err(|e| format!("Error al construir stream de captura de audio: {e}"))?;
     
+    let mut cipher_tx = lanpilot_core::Rc4Cipher::new(format!("{}-audio-h2c", pair_code).as_bytes());
+
     cpal_stream
         .play()
         .map_err(|e| format!("Error al iniciar stream de captura de audio: {e}"))?;
@@ -2669,7 +2798,8 @@ fn handle_audio_stream(
                     byte_buffer.push(byte);
                     i += 2;
                 }
-                let compressed = lz4_flex::compress_prepend_size(&byte_buffer);
+                let mut compressed = lz4_flex::compress_prepend_size(&byte_buffer);
+                cipher_tx.crypt(&mut compressed);
                 let len = compressed.len() as u32;
                 let mut write_err = stream.write_all(&len.to_le_bytes());
                 if write_err.is_ok() {

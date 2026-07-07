@@ -3,6 +3,62 @@ use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use base64::prelude::BASE64_STANDARD;
+use base64::Engine;
+
+#[derive(Clone)]
+pub struct Rc4Cipher {
+    s: [u8; 256],
+    i: u8,
+    j: u8,
+}
+
+impl Rc4Cipher {
+    pub fn new(key: &[u8]) -> Self {
+        let mut s = [0u8; 256];
+        for i in 0..256 {
+            s[i] = i as u8;
+        }
+        let mut j: u8 = 0;
+        if !key.is_empty() {
+            for i in 0..256 {
+                let key_byte = key[i % key.len()];
+                j = j.wrapping_add(s[i]).wrapping_add(key_byte);
+                s.swap(i, j as usize);
+            }
+        }
+        Rc4Cipher { s, i: 0, j: 0 }
+    }
+
+    pub fn crypt(&mut self, data: &mut [u8]) {
+        for byte in data.iter_mut() {
+            self.i = self.i.wrapping_add(1);
+            self.j = self.j.wrapping_add(self.s[self.i as usize]);
+            self.s.swap(self.i as usize, self.j as usize);
+            let k = self.s[(self.s[self.i as usize].wrapping_add(self.s[self.j as usize])) as usize];
+            *byte ^= k;
+        }
+    }
+}
+
+pub fn encrypt_line(line: &str, cipher: &mut Rc4Cipher) -> String {
+    let mut bytes = line.as_bytes().to_vec();
+    cipher.crypt(&mut bytes);
+    let encoded = BASE64_STANDARD.encode(&bytes);
+    format!("{}\n", encoded)
+}
+
+pub fn decrypt_line(line: &str, cipher: &mut Rc4Cipher) -> Result<String, String> {
+    let cleaned = line.trim();
+    if cleaned.is_empty() {
+        return Ok(String::new());
+    }
+    let decoded = BASE64_STANDARD.decode(cleaned)
+        .map_err(|e| format!("decode failed: {e}"))?;
+    let mut decrypted = decoded;
+    cipher.crypt(&mut decrypted);
+    String::from_utf8(decrypted).map_err(|e| format!("utf8 conversion failed: {e}"))
+}
 
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -297,6 +353,12 @@ pub enum ControlEvent {
         filename: String,
         offset: u64,
     },
+    ClipboardRichText {
+        format: String,
+        payload_b64: String,
+    },
+    ReduceQuality,
+    IncreaseQuality,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -882,4 +944,104 @@ mod tests {
         flag.store(true, Ordering::Relaxed);
         assert!(is_stopped(&flag));
     }
+}
+
+#[cfg(windows)]
+pub fn read_rich_clipboard(format_name: &str) -> Option<Vec<u8>> {
+    unsafe {
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn OpenClipboard(hWndNewOwner: *mut std::ffi::c_void) -> i32;
+            fn CloseClipboard() -> i32;
+            fn GetClipboardData(uFormat: u32) -> *mut std::ffi::c_void;
+            fn RegisterClipboardFormatA(lpszFormat: *const u8) -> u32;
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GlobalLock(hMem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+            fn GlobalUnlock(hMem: *mut std::ffi::c_void) -> i32;
+            fn GlobalSize(hMem: *mut std::ffi::c_void) -> usize;
+        }
+
+        let fmt_cstr = std::ffi::CString::new(format_name).ok()?;
+        let format_id = RegisterClipboardFormatA(fmt_cstr.as_ptr() as *const u8);
+        if format_id == 0 {
+            return None;
+        }
+
+        if OpenClipboard(std::ptr::null_mut()) != 0 {
+            let handle = GetClipboardData(format_id);
+            if !handle.is_null() {
+                let size = GlobalSize(handle);
+                if size > 0 {
+                    let ptr = GlobalLock(handle);
+                    if !ptr.is_null() {
+                        let slice = std::slice::from_raw_parts(ptr as *const u8, size);
+                        let mut data = vec![0u8; size];
+                        data.copy_from_slice(slice);
+                        GlobalUnlock(handle);
+                        CloseClipboard();
+                        
+                        if let Some(pos) = data.iter().position(|&b| b == 0) {
+                            data.truncate(pos);
+                        }
+                        return Some(data);
+                    }
+                }
+            }
+            CloseClipboard();
+        }
+    }
+    None
+}
+
+#[cfg(not(windows))]
+pub fn read_rich_clipboard(_format_name: &str) -> Option<Vec<u8>> {
+    None
+}
+
+#[cfg(windows)]
+pub fn write_rich_clipboard(format_name: &str, data: &[u8]) -> Result<(), String> {
+    unsafe {
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn OpenClipboard(hWndNewOwner: *mut std::ffi::c_void) -> i32;
+            fn CloseClipboard() -> i32;
+            fn SetClipboardData(uFormat: u32, hMem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+            fn RegisterClipboardFormatA(lpszFormat: *const u8) -> u32;
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GlobalAlloc(uFlags: u32, dwBytes: usize) -> *mut std::ffi::c_void;
+            fn GlobalLock(hMem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+            fn GlobalUnlock(hMem: *mut std::ffi::c_void) -> i32;
+        }
+
+        let fmt_cstr = std::ffi::CString::new(format_name).map_err(|e| e.to_string())?;
+        let format_id = RegisterClipboardFormatA(fmt_cstr.as_ptr() as *const u8);
+        if format_id == 0 {
+            return Err("No se pudo registrar el formato de clipboard".to_string());
+        }
+
+        if OpenClipboard(std::ptr::null_mut()) != 0 {
+            let handle = GlobalAlloc(0x0002, data.len() + 1); // GMEM_MOVEABLE = 0x0002
+            if !handle.is_null() {
+                let ptr = GlobalLock(handle);
+                if !ptr.is_null() {
+                    let dst_slice = std::slice::from_raw_parts_mut(ptr as *mut u8, data.len() + 1);
+                    dst_slice[..data.len()].copy_from_slice(data);
+                    dst_slice[data.len()] = 0;
+                    GlobalUnlock(handle);
+                    SetClipboardData(format_id, handle);
+                }
+            }
+            CloseClipboard();
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn write_rich_clipboard(_format_name: &str, _data: &[u8]) -> Result<(), String> {
+    Err("Solo soportado en Windows".to_string())
 }
