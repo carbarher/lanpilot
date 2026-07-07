@@ -1142,6 +1142,31 @@ fn handle_control_stream(
                     }
                 }
             }
+            if let ControlEvent::FileTransferFinished { filename, .. } = event {
+                #[cfg(windows)]
+                {
+                    let home = std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\".to_string());
+                    let downloads_dir = format!("{}\\Desktop\\LanPilot-Downloads", home);
+                    let safe_filename = std::path::Path::new(filename)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("descarga");
+                    let target_path = format!("{}\\{}", downloads_dir, safe_filename);
+                    
+                    logger.log(format!("Zero-Click File Paste: registrando archivo finalizado en clipboard: {}", target_path));
+                    let _ = lanpilot_core::write_clipboard_files(&[target_path]);
+                }
+            }
+            if let ControlEvent::ClipboardFiles { paths_b64 } = event {
+                #[cfg(windows)]
+                if let Ok(decoded) = BASE64.decode(paths_b64) {
+                    if let Ok(paths_str) = String::from_utf8(decoded) {
+                        let paths: Vec<String> = paths_str.split('\n').map(|s| s.to_string()).collect();
+                        logger.log(format!("Zero-Click File Paste: sincronizando lista de {} archivos.", paths.len()));
+                        let _ = lanpilot_core::write_clipboard_files(&paths);
+                    }
+                }
+            }
             if let ControlEvent::SetVideoFormat { use_rgb565 } = event {
                 if let Ok(mut guard) = tuning.lock() {
                     guard.use_rgb565 = *use_rgb565;

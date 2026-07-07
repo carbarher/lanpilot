@@ -359,6 +359,13 @@ pub enum ControlEvent {
     },
     ReduceQuality,
     IncreaseQuality,
+    FileTransferFinished {
+        filename: String,
+        temp_path: String,
+    },
+    ClipboardFiles {
+        paths_b64: String, // Lista de paths codificada en Base64 para compatibilidad
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1052,4 +1059,141 @@ pub fn write_rich_clipboard(format_name: &str, data: &[u8]) -> Result<(), String
 #[cfg(not(windows))]
 pub fn write_rich_clipboard(_format_name: &str, _data: &[u8]) -> Result<(), String> {
     Err("Solo soportado en Windows".to_string())
+}
+
+#[cfg(windows)]
+pub fn read_clipboard_files() -> Option<Vec<String>> {
+    unsafe {
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn OpenClipboard(hWndNewOwner: *mut std::ffi::c_void) -> i32;
+            fn CloseClipboard() -> i32;
+            fn GetClipboardData(uFormat: u32) -> *mut std::ffi::c_void;
+            fn IsClipboardFormatAvailable(uFormat: u32) -> i32;
+        }
+        #[link(name = "shell32")]
+        unsafe extern "system" {
+            fn DragQueryFileW(hDrop: *mut std::ffi::c_void, iFile: u32, lpszFile: *mut u16, cch: u32) -> u32;
+        }
+
+        if IsClipboardFormatAvailable(15) == 0 { // CF_HDROP = 15
+            return None;
+        }
+
+        if OpenClipboard(std::ptr::null_mut()) != 0 {
+            let h_drop = GetClipboardData(15);
+            if h_drop.is_null() {
+                CloseClipboard();
+                return None;
+            }
+
+            let count = DragQueryFileW(h_drop, 0xFFFFFFFF, std::ptr::null_mut(), 0);
+            let mut paths = Vec::new();
+            for i in 0..count {
+                let len = DragQueryFileW(h_drop, i, std::ptr::null_mut(), 0);
+                if len > 0 {
+                    let mut buf = vec![0u16; len as usize + 1];
+                    DragQueryFileW(h_drop, i, buf.as_mut_ptr(), len + 1);
+                    if let Ok(path) = String::from_utf16(&buf[0..len as usize]) {
+                        paths.push(path);
+                    }
+                }
+            }
+            CloseClipboard();
+            return Some(paths);
+        }
+    }
+    None
+}
+
+#[cfg(not(windows))]
+pub fn read_clipboard_files() -> Option<Vec<String>> {
+    None
+}
+
+#[cfg(windows)]
+pub fn write_clipboard_files(paths: &[String]) -> Result<(), String> {
+    unsafe {
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn OpenClipboard(hWndNewOwner: *mut std::ffi::c_void) -> i32;
+            fn CloseClipboard() -> i32;
+            fn EmptyClipboard() -> i32;
+            fn SetClipboardData(uFormat: u32, hMem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GlobalAlloc(uFlags: u32, dwBytes: usize) -> *mut std::ffi::c_void;
+            fn GlobalFree(hMem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+            fn GlobalLock(hMem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+            fn GlobalUnlock(hMem: *mut std::ffi::c_void) -> i32;
+        }
+
+        if paths.is_empty() {
+            return Ok(());
+        }
+
+        // Codificar las rutas a UTF-16
+        let mut raw_data = Vec::new();
+        for path in paths {
+            let mut utf16: Vec<u16> = path.encode_utf16().collect();
+            utf16.push(0); // Terminador nulo por ruta
+            raw_data.extend(utf16);
+        }
+        raw_data.push(0); // Terminador nulo doble final de la lista
+
+        let size = 20 + (raw_data.len() * 2); // 20 bytes de DROPFILES + bytes de UTF-16
+        let handle = GlobalAlloc(0x0002, size); // GMEM_MOVEABLE = 0x0002
+        if handle.is_null() {
+            return Err("GlobalAlloc falló".to_string());
+        }
+
+        let ptr = GlobalLock(handle);
+        if ptr.is_null() {
+            GlobalFree(handle);
+            return Err("GlobalLock falló".to_string());
+        }
+
+        // Escribir cabecera DROPFILES (20 bytes)
+        // struct DROPFILES { pFiles: u32, pt: POINT (8 bytes), fNC: i32, fWide: i32 }
+        let dropfiles_ptr = ptr as *mut u32;
+        *dropfiles_ptr.offset(0) = 20; // pFiles = 20
+        *dropfiles_ptr.offset(1) = 0;  // pt.x = 0
+        *dropfiles_ptr.offset(2) = 0;  // pt.y = 0
+        *dropfiles_ptr.offset(3) = 0;  // fNC = 0
+        *dropfiles_ptr.offset(4) = 1;  // fWide = 1 (Unicode)
+
+        // Escribir los caracteres UTF-16 a partir del byte 20
+        let dest_data_ptr = (ptr as *mut u8).offset(20) as *mut u16;
+        std::ptr::copy_nonoverlapping(raw_data.as_ptr(), dest_data_ptr, raw_data.len());
+
+        GlobalUnlock(handle);
+
+        if OpenClipboard(std::ptr::null_mut()) != 0 {
+            let _ = EmptyClipboard();
+            let res = SetClipboardData(15, handle); // CF_HDROP = 15
+            if res.is_null() {
+                GlobalFree(handle);
+            }
+            CloseClipboard();
+            Ok(())
+        } else {
+            GlobalFree(handle);
+            Err("No se pudo abrir el clipboard".to_string())
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn write_clipboard_files(_paths: &[String]) -> Result<(), String> {
+    Err("Solo soportado en Windows".to_string())
+}
+
+pub fn get_local_ip() -> Option<String> {
+    std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|socket| {
+            socket.connect("8.8.8.8:80")?;
+            Ok(socket.local_addr()?.ip().to_string())
+        })
+        .ok()
 }

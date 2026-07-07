@@ -703,27 +703,63 @@ impl LanPilotApp {
     fn draw_hosting(&mut self, ui: &mut egui::Ui) {
         ui.vertical_centered(|ui| {
             ui.heading("Este equipo comparte pantalla");
-            ui.add_space(16.0);
+            ui.add_space(8.0);
+            
+            // Generar URI de conexión rápida
+            let local_ip = lanpilot_core::get_local_ip().unwrap_or_else(|| "127.0.0.1".to_string());
+            let connection_uri = format!("lanpilot://connect?ip={}&code={}", local_ip, self.pair_code);
+
             ui.group(|ui| {
-                ui.add_space(10.0);
-                ui.label("Modo espera activo");
-                ui.heading(egui::RichText::new("Listo para conectar").size(30.0));
+                ui.add_space(6.0);
+                ui.label("Escanear para conectar instantáneamente:");
                 ui.add_space(8.0);
+                
+                if let Ok(qr) = qrcodegen::QrCode::encode_text(&connection_uri, qrcodegen::QrCodeEcc::Medium) {
+                    let size = qr.size();
+                    let scale = 4.0; 
+                    let padding = 8.0; 
+                    let qr_width = size as f32 * scale;
+                    let total_width = qr_width + padding * 2.0;
+                    
+                    let (rect, _) = ui.allocate_exact_size(
+                        egui::vec2(total_width, total_width),
+                        egui::Sense::hover(),
+                    );
+                    let painter = ui.painter_at(rect);
+                    painter.rect_filled(rect, 8.0, egui::Color32::WHITE); 
+                    
+                    let qr_start = rect.min + egui::vec2(padding, padding);
+                    for y in 0..size {
+                        for x in 0..size {
+                            if qr.get_module(x, y) {
+                                let min = qr_start + egui::vec2(x as f32 * scale, y as f32 * scale);
+                                let max = min + egui::vec2(scale, scale);
+                                painter.rect_filled(egui::Rect::from_min_max(min, max), 0.0, egui::Color32::from_rgb(26, 29, 36)); 
+                            }
+                        }
+                    }
+                }
+                ui.add_space(6.0);
             });
-            ui.add_space(12.0);
-            ui.label("En el otro equipo abre LanPilot y pulsa “Conectarme”.");
-            if let Some(started) = self.started_at {
-                ui.label(format!(
-                    "Esperando conexión... {} s",
-                    started.elapsed().as_secs()
-                ));
-            }
-            ui.add_space(12.0);
+            ui.add_space(8.0);
+            
+            ui.group(|ui| {
+                ui.add_space(6.0);
+                ui.label(format!("Código de enlace: {}", self.pair_code));
+                if let Some(started) = self.started_at {
+                    ui.label(format!(
+                        "Esperando conexión... {} s",
+                        started.elapsed().as_secs()
+                    ));
+                }
+                ui.add_space(6.0);
+            });
+            ui.add_space(8.0);
             if ui.button("Detener").clicked() {
                 self.stop_process();
                 self.screen = Screen::Home;
             }
-            ui.add_space(16.0);
+            ui.add_space(12.0);
             self.draw_log_box(ui);
         });
     }

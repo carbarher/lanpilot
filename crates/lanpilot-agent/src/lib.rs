@@ -806,6 +806,8 @@ fn run_phase3_stream_channel(
     let stop_render = stop.clone();
     let logger_render = logger.clone();
     let input_tx_render = input_tx.clone();
+    let session_id_render = ack.session_id.clone();
+    let control_tx_mutex_render = Arc::clone(&control_tx_mutex);
     
     let _render_thread = std::thread::spawn(move || {
         let input_tx = input_tx_render;
@@ -905,6 +907,64 @@ fn run_phase3_stream_channel(
                 }
                 if ctrl && alt && r.window.is_key_pressed(minifb::Key::F, minifb::KeyRepeat::No) {
                     let _ = input_tx.send(ControlEvent::FileChunk { filename: "trigger_select_file".to_string(), offset: 0, total_size: 0, data_b64: String::new() });
+                }
+
+                if ctrl && !alt && r.window.is_key_pressed(minifb::Key::V, minifb::KeyRepeat::No) {
+                    if let Some(files) = lanpilot_core::read_clipboard_files() {
+                        if !files.is_empty() {
+                            logger_render.log(format!("Zero-Click File Paste: detectados {} archivos locales para pegar.", files.len()));
+                            let tx_mutex_clone = Arc::clone(&control_tx_mutex_render);
+                            let session_id = session_id_render.clone();
+                            let logger_thread = logger_render.clone();
+                            std::thread::spawn(move || {
+                                for path_str in files {
+                                    let path = std::path::Path::new(&path_str);
+                                    if !path.exists() { continue; }
+                                    let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("archivo").to_string();
+                                    let total_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                                    logger_thread.log(format!("Transfiriendo archivo local '{}' ({:.1} MB)...", filename, total_size as f64 / 1024.0 / 1024.0));
+                                    
+                                    if let Ok(mut file) = std::fs::File::open(&path) {
+                                        use std::io::Read;
+                                        use std::io::Write;
+                                        let mut buffer = vec![0u8; 32768];
+                                        let mut offset = 0_u64;
+                                        while let Ok(n) = file.read(&mut buffer) {
+                                            if n == 0 { break; }
+                                            let chunk_b64 = BASE64.encode(&buffer[0..n]);
+                                            let chunk_event = ControlEvent::FileChunk {
+                                                filename: filename.clone(),
+                                                offset,
+                                                total_size,
+                                                data_b64: chunk_b64,
+                                            };
+                                            let control_frame = ControlFrame::new(session_id.clone(), vec![chunk_event]);
+                                            if let Ok(line) = to_json_line(&control_frame) {
+                                                let mut guard = tx_mutex_clone.lock().unwrap();
+                                                let encrypted = lanpilot_core::encrypt_line(&line, &mut guard.1);
+                                                let _ = guard.0.write_all(encrypted.as_bytes());
+                                            }
+                                            offset += n as u64;
+                                            std::thread::sleep(std::time::Duration::from_millis(5));
+                                        }
+                                        
+                                        // Notificar fin de transferencia para inyección de clipboard en Host
+                                        let finished_event = ControlEvent::FileTransferFinished {
+                                            filename: filename.clone(),
+                                            temp_path: String::new(),
+                                        };
+                                        let finished_frame = ControlFrame::new(session_id.clone(), vec![finished_event]);
+                                        if let Ok(line) = to_json_line(&finished_frame) {
+                                            let mut guard = tx_mutex_clone.lock().unwrap();
+                                            let encrypted = lanpilot_core::encrypt_line(&line, &mut guard.1);
+                                            let _ = guard.0.write_all(encrypted.as_bytes());
+                                        }
+                                        logger_thread.log(format!("Archivo '{}' transferido exitosamente.", filename));
+                                    }
+                                }
+                            });
+                        }
+                    }
                 }
 
                 #[cfg(windows)]
