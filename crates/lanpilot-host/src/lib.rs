@@ -1133,11 +1133,13 @@ fn handle_control_stream(
                     let target_path = format!("{}\\{}", downloads_dir, safe_filename);
                     
                     if let Ok(decoded_data) = BASE64.decode(data_b64) {
+                        let truncate = *offset == 0;
                         let write_result = {
                             use std::os::windows::fs::FileExt;
                             std::fs::OpenOptions::new()
                                 .write(true)
                                 .create(true)
+                                .truncate(truncate)
                                 .open(&target_path)
                                 .and_then(|file| {
                                     file.seek_write(&decoded_data, *offset)
