@@ -14,3 +14,10 @@ repository = "https://github.com/carbarher/lanpilot"
 
 [patch.crates-io]
 block = { path = "third_party/block-0.1.6" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

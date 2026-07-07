@@ -2228,268 +2228,207 @@ fn spawn_audio_client(host_ipv4: String, stop: StopFlag, logger: Logger, pair_co
     use std::collections::VecDeque;
 
     std::thread::spawn(move || {
-        let endpoint = format!("{}:{}", host_ipv4, AUDIO_PORT);
-        logger.log(format!("Conectando al stream de audio en {}...", endpoint));
-        
-        let mut stream = match TcpStream::connect(&endpoint) {
-            Ok(s) => {
-                let _ = s.set_nodelay(true);
-                s
-            }
-            Err(e) => {
-                logger.log(format!("Aviso: no se pudo conectar al servidor de audio: {e}"));
-                return;
-            }
-        };
-        
-        let mut header = [0u8; 8];
-        if let Err(e) = std::io::Read::read_exact(&mut stream, &mut header) {
-            logger.log(format!("Aviso: error al leer cabecera de audio: {e}"));
-            return;
-        }
-        
-        let sample_rate = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
-        let channels = u16::from_le_bytes([header[4], header[5]]);
-        let use_compression = u16::from_le_bytes([header[6], header[7]]) == 1;
-        
-        logger.log(format!(
-            "Stream de audio inicializado: {} Hz, {} canales (PCM 16-bit, compression={})",
-            sample_rate, channels, use_compression
-        ));
-        
-        #[cfg(windows)]
-        unsafe {
-            #[link(name = "ole32")]
-            unsafe extern "system" {
-                fn CoInitializeEx(pv_reserved: *mut std::ffi::c_void, dw_co_init: u32) -> i32;
-            }
-            let _ = CoInitializeEx(std::ptr::null_mut(), 0x2);
-        }
-        
-        let host = cpal::default_host();
-        let device = match host.default_output_device() {
-            Some(d) => d,
-            None => {
-                logger.log("Aviso: no se encontró dispositivo de salida de audio".to_string());
-                return;
-            }
-        };
-        
-        let output_config = match device.default_output_config() {
-            Ok(c) => c,
-            Err(e) => {
-                logger.log(format!("Aviso: no se pudo obtener la configuración de salida de audio: {e}"));
-                return;
-            }
-        };
-        let agent_config: cpal::StreamConfig = output_config.clone().into();
-        let agent_sample_rate = agent_config.sample_rate.0 as f64;
-        let agent_channels = agent_config.channels as usize;
-        
-        let host_sample_rate = sample_rate as f64;
-        let host_channels = channels as usize;
-        
-        logger.log(format!(
-            "Tarjeta local de audio: {} Hz, {} canales",
-            agent_config.sample_rate.0, agent_config.channels
-        ));
-        
-        let audio_buffer = Arc::new(Mutex::new(VecDeque::<i16>::new()));
-        let play_buffer = Arc::clone(&audio_buffer);
-        
-        // Estado del resampler lineal y Jitter Buffer adaptativo
-        let mut last_frame = vec![0.0f32; host_channels];
-        let mut next_frame = vec![0.0f32; host_channels];
-        let mut phase = 0.0f64;
-        let base_factor = host_sample_rate / agent_sample_rate;
-        let target_latency_samples = (host_sample_rate * host_channels as f64 * 0.08) as usize; // 80ms target
-        let threshold = (host_sample_rate * host_channels as f64 * 0.02) as usize; // 20ms threshold
-        let mut fade_volume = 1.0f32;
-        
-        let cpal_stream = match device.build_output_stream(
-            &agent_config,
-            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                let mut buffer = play_buffer.lock().unwrap();
-                let current_len = buffer.len();
+        while !is_stopped(&stop) {
+            let res = (|| -> Result<(), String> {
+                let endpoint = format!("{}:{}", host_ipv4, AUDIO_PORT);
+                logger.log(format!("Conectando al stream de audio en {}...", endpoint));
                 
-                // Modular la velocidad de resampler para sincronizar la latencia
-                let speed_multiplier = if current_len > target_latency_samples + threshold {
-                    1.02f64 // Consumir buffer un 2% más rápido
-                } else if current_len > 0 && current_len < target_latency_samples.saturating_sub(threshold) {
-                    0.98f64 // Estirar el buffer un 2% más lento
-                } else {
-                    1.00f64
-                };
-                let current_factor = base_factor * speed_multiplier;
+                let mut stream = TcpStream::connect(&endpoint)
+                    .map_err(|e| format!("no se pudo conectar al servidor de audio: {e}"))?;
+                let _ = stream.set_nodelay(true);
                 
-                for frame in data.chunks_exact_mut(agent_channels) {
-                    while phase >= 1.0 {
-                        last_frame.copy_from_slice(&next_frame);
-                        if buffer.len() >= host_channels {
-                            for i in 0..host_channels {
-                                if let Some(s) = buffer.pop_front() {
-                                    next_frame[i] = (s as f32) / 32768.0;
-                                }
-                            }
-                            phase -= 1.0;
+                let mut header = [0u8; 8];
+                std::io::Read::read_exact(&mut stream, &mut header)
+                    .map_err(|e| format!("error al leer cabecera de audio: {e}"))?;
+                
+                let sample_rate = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+                let channels = u16::from_le_bytes([header[4], header[5]]);
+                let use_compression = u16::from_le_bytes([header[6], header[7]]) == 1;
+                
+                logger.log(format!(
+                    "Stream de audio inicializado: {} Hz, {} canales (PCM 16-bit, compression={})",
+                    sample_rate, channels, use_compression
+                ));
+                
+                #[cfg(windows)]
+                unsafe {
+                    #[link(name = "ole32")]
+                    unsafe extern "system" {
+                        fn CoInitializeEx(pv_reserved: *mut std::ffi::c_void, dw_co_init: u32) -> i32;
+                    }
+                    let _ = CoInitializeEx(std::ptr::null_mut(), 0x2);
+                }
+                
+                let host = cpal::default_host();
+                let device = host.default_output_device()
+                    .ok_or_else(|| "no se encontró dispositivo de salida de audio".to_string())?;
+                
+                let output_config = device.default_output_config()
+                    .map_err(|e| format!("no se pudo obtener la configuración de salida de audio: {e}"))?;
+                
+                let agent_config: cpal::StreamConfig = output_config.clone().into();
+                let agent_sample_rate = agent_config.sample_rate.0 as f64;
+                let agent_channels = agent_config.channels as usize;
+                
+                let host_sample_rate = sample_rate as f64;
+                let host_channels = channels as usize;
+                
+                logger.log(format!(
+                    "Tarjeta local de audio: {} Hz, {} canales",
+                    agent_config.sample_rate.0, agent_config.channels
+                ));
+                
+                let audio_buffer = Arc::new(Mutex::new(VecDeque::<i16>::new()));
+                let play_buffer = Arc::clone(&audio_buffer);
+                
+                let mut phase = 0.0f64;
+                let base_factor = host_sample_rate / agent_sample_rate;
+                let target_latency_samples = (host_sample_rate * host_channels as f64 * 0.08) as usize; 
+                let threshold = (host_sample_rate * host_channels as f64 * 0.02) as usize; 
+                let mut fade_volume = 1.0f32;
+                
+                let cpal_stream = device.build_output_stream(
+                    &agent_config,
+                    move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                        let mut buffer = play_buffer.lock().unwrap();
+                        
+                        let current_factor = if buffer.len() > target_latency_samples + threshold {
+                            base_factor * 1.01
+                        } else if !buffer.is_empty() && buffer.len() < target_latency_samples.saturating_sub(threshold) {
+                            base_factor * 0.99
+                        } else {
+                            base_factor
+                        };
+                        
+                        if buffer.is_empty() {
+                            fade_volume = (fade_volume - 0.05).max(0.0);
+                        } else {
                             fade_volume = (fade_volume + 0.05).min(1.0);
-                        } else {
-                            fade_volume = (fade_volume - 0.02).max(0.0);
-                            if fade_volume == 0.0 {
-                                next_frame.fill(0.0);
-                                phase = 0.0;
-                                break;
-                            } else {
-                                for i in 0..host_channels {
-                                    next_frame[i] = next_frame[i] * fade_volume;
+                        }
+                        
+                        for frame in data.chunks_mut(agent_channels) {
+                            if phase >= 1.0 {
+                                let steps = phase.floor() as usize;
+                                let samples_to_consume = steps * host_channels;
+                                if buffer.len() >= samples_to_consume {
+                                    buffer.drain(0..samples_to_consume);
                                 }
-                                phase -= 1.0;
+                                phase -= steps as f64;
+                            }
+                            
+                            let t = phase as f32;
+                            let get_sample = |buf: &std::collections::VecDeque<i16>, ch: usize, t_val: f32| -> f32 {
+                                if buf.len() >= host_channels * 2 {
+                                    let s_prev = buf[ch] as f32 / 32767.0;
+                                    let s_next = buf[host_channels + ch] as f32 / 32767.0;
+                                    s_prev + (s_next - s_prev) * t_val
+                                } else if !buf.is_empty() {
+                                    buf[ch % buf.len()] as f32 / 32767.0
+                                } else {
+                                    0.0
+                                }
+                            };
+                            
+                            for i in 0..agent_channels {
+                                let val = if host_channels == 1 {
+                                    get_sample(&buffer, 0, t)
+                                } else if host_channels == 2 && agent_channels == 1 {
+                                    (get_sample(&buffer, 0, t) + get_sample(&buffer, 1, t)) * 0.5
+                                } else if host_channels == 2 && agent_channels > 2 {
+                                    if i % 2 == 0 {
+                                        get_sample(&buffer, 0, t)
+                                    } else {
+                                        get_sample(&buffer, 1, t)
+                                    }
+                                } else {
+                                    get_sample(&buffer, i, t)
+                                };
+                                frame[i] = val * fade_volume;
+                            }
+                            
+                            phase += current_factor;
+                        }
+                    },
+                    |err| eprintln!("an error occurred on stream: {}", err),
+                    None
+                ).map_err(|e| format!("no se pudo crear el stream de salida de audio: {e}"))?;
+                
+                cpal_stream.play()
+                    .map_err(|e| format!("no se pudo iniciar la reproducción de audio: {e}"))?;
+                
+                let mut temp_buf = [0u8; 4096];
+                let mut predictor = 0;
+                let mut step_index = 0;
+                let mut cipher_rx = lanpilot_core::Rc4Cipher::new(format!("{}-audio-h2c", pair_code).as_bytes());
+                
+                if use_compression {
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
+                    
+                    let mut len_bytes = [0u8; 4];
+                    while !is_stopped(&stop) {
+                        if let Err(e) = std::io::Read::read_exact(&mut stream, &mut len_bytes) {
+                            if e.kind() == std::io::ErrorKind::TimedOut || e.kind() == std::io::ErrorKind::WouldBlock {
+                                continue;
+                            }
+                            return Err("Desconexión en stream de audio comprimido.".to_string());
+                        }
+                        let compressed_len = u32::from_le_bytes(len_bytes) as usize;
+                        let mut compressed_data = vec![0u8; compressed_len];
+                        if let Err(e) = std::io::Read::read_exact(&mut stream, &mut compressed_data) {
+                            return Err(format!("Error leyendo payload de audio comprimido: {e}"));
+                        }
+                        
+                        cipher_rx.crypt(&mut compressed_data);
+                        
+                        if let Ok(decompressed) = decompress_size_prepended(&compressed_data) {
+                            let mut buffer = audio_buffer.lock().unwrap();
+                            for byte in decompressed {
+                                let code1 = byte & 0x0F;
+                                let code2 = (byte >> 4) & 0x0F;
+                                let s1 = lanpilot_core::adpcm_decode_sample(code1, &mut predictor, &mut step_index);
+                                let s2 = lanpilot_core::adpcm_decode_sample(code2, &mut predictor, &mut step_index);
+                                buffer.push_back(s1);
+                                buffer.push_back(s2);
                             }
                         }
                     }
-                    
-                    let t = phase as f32;
-                    let interpolated_channel = |ch: usize| -> f32 {
-                        if ch < host_channels {
-                            ((1.0 - t) * last_frame[ch] + t * next_frame[ch]) * fade_volume
-                        } else {
-                            0.0
-                        }
-                    };
-                    
-                    for i in 0..agent_channels {
-                        if host_channels == 1 {
-                            frame[i] = interpolated_channel(0);
-                        } else if host_channels == 2 && agent_channels == 1 {
-                            frame[i] = (interpolated_channel(0) + interpolated_channel(1)) * 0.5;
-                        } else if host_channels == 2 && agent_channels > 2 {
-                            if i % 2 == 0 {
-                                frame[i] = interpolated_channel(0);
-                            } else {
-                                frame[i] = interpolated_channel(1);
+                } else {
+                    let _ = stream.set_nonblocking(true);
+                    while !is_stopped(&stop) {
+                        match std::io::Read::read(&mut stream, &mut temp_buf) {
+                            Ok(0) => return Err("Stream de audio cerrado por el host.".to_string()),
+                            Ok(n) => {
+                                let mut buffer = audio_buffer.lock().unwrap();
+                                let bytes = &temp_buf[0..n];
+                                
+                                for &byte in bytes {
+                                    let code1 = byte & 0x0F;
+                                    let code2 = (byte >> 4) & 0x0F;
+                                    
+                                    let s1 = lanpilot_core::adpcm_decode_sample(code1, &mut predictor, &mut step_index);
+                                    let s2 = lanpilot_core::adpcm_decode_sample(code2, &mut predictor, &mut step_index);
+                                    
+                                    buffer.push_back(s1);
+                                    buffer.push_back(s2);
+                                }
                             }
-                        } else {
-                            frame[i] = interpolated_channel(i);
+                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
+                            Err(e) => return Err(format!("Error de lectura en stream de audio: {e}")),
                         }
                     }
-                    
-                    phase += current_factor;
                 }
-            },
-            |err| eprintln!("an error occurred on stream: {}", err),
-            None
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                logger.log(format!("Aviso: no se pudo crear el stream de salida de audio: {e}"));
-                return;
-            }
-        };
-        
-        if let Err(e) = cpal_stream.play() {
-            logger.log(format!("Aviso: no se pudo iniciar la reproducción de audio: {e}"));
-            return;
-        }
-        
-        let mut temp_buf = [0u8; 4096];
-        let mut predictor = 0;
-        let mut step_index = 0;
-
-        let mut cipher_rx = lanpilot_core::Rc4Cipher::new(format!("{}-audio-h2c", pair_code).as_bytes());
-
-        if use_compression {
-            let _ = stream.set_nonblocking(false);
-            let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
+                
+                Ok(())
+            })();
             
-            let mut len_bytes = [0u8; 4];
-            while !is_stopped(&stop) {
-                if let Err(e) = std::io::Read::read_exact(&mut stream, &mut len_bytes) {
-                    if e.kind() == std::io::ErrorKind::TimedOut || e.kind() == std::io::ErrorKind::WouldBlock {
-                        continue;
-                    }
-                    logger.log("Desconexión en stream de audio comprimido.".to_string());
-                    break;
-                }
-                let compressed_len = u32::from_le_bytes(len_bytes) as usize;
-                let mut compressed_data = vec![0u8; compressed_len];
-                if let Err(e) = std::io::Read::read_exact(&mut stream, &mut compressed_data) {
-                    logger.log(format!("Error leyendo payload de audio comprimido: {e}"));
-                    break;
-                }
-                
-                cipher_rx.crypt(&mut compressed_data);
-                
-                if let Ok(decompressed) = decompress_size_prepended(&compressed_data) {
-                    let mut buffer = audio_buffer.lock().unwrap();
-                    for byte in decompressed {
-                        let code1 = byte & 0x0F;
-                        let code2 = (byte >> 4) & 0x0F;
-                        let s1 = lanpilot_core::adpcm_decode_sample(code1, &mut predictor, &mut step_index);
-                        let s2 = lanpilot_core::adpcm_decode_sample(code2, &mut predictor, &mut step_index);
-                        buffer.push_back(s1);
-                        buffer.push_back(s2);
-                    }
-                    
-                    let max_latency_samples = (sample_rate as usize * channels as usize) / 4;
-                    if buffer.len() > max_latency_samples {
-                        let discard = buffer.len() - (max_latency_samples / 2);
-                        buffer.drain(0..discard);
-                        
-                        let fade_len = ((sample_rate as usize * 5 / 1000) * channels as usize).min(buffer.len());
-                        for i in 0..fade_len {
-                            let factor = i as f32 / fade_len as f32;
-                            buffer[i] = (buffer[i] as f32 * factor) as i16;
-                        }
-                    }
-                }
+            if let Err(err) = res {
+                logger.log(format!("Aviso de Audio: {err}. Reintentando conexion..."));
             }
-        } else {
-            let _ = stream.set_nonblocking(true);
-            while !is_stopped(&stop) {
-                match std::io::Read::read(&mut stream, &mut temp_buf) {
-                    Ok(0) => {
-                        logger.log("Stream de audio cerrado por el host.".to_string());
-                        break;
-                    }
-                    Ok(n) => {
-                        let mut buffer = audio_buffer.lock().unwrap();
-                        let bytes = &temp_buf[0..n];
-                        
-                        for &byte in bytes {
-                            let code1 = byte & 0x0F;
-                            let code2 = (byte >> 4) & 0x0F;
-                            
-                            let s1 = lanpilot_core::adpcm_decode_sample(code1, &mut predictor, &mut step_index);
-                            let s2 = lanpilot_core::adpcm_decode_sample(code2, &mut predictor, &mut step_index);
-                            
-                            buffer.push_back(s1);
-                            buffer.push_back(s2);
-                        }
-                        
-                        let max_latency_samples = (sample_rate as usize * channels as usize) / 4;
-                        if buffer.len() > max_latency_samples {
-                            let discard = buffer.len() - (max_latency_samples / 2);
-                            buffer.drain(0..discard);
-                            
-                            let fade_len = ((sample_rate as usize * 5 / 1000) * channels as usize).min(buffer.len());
-                            for i in 0..fade_len {
-                                let factor = i as f32 / fade_len as f32;
-                                buffer[i] = (buffer[i] as f32 * factor) as i16;
-                            }
-                        }
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(e) => {
-                        logger.log(format!("Error de lectura en stream de audio: {e}"));
-                        break;
-                    }
-                }
-            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
         }
-        
-        let _ = cpal_stream.pause();
     });
 }
 

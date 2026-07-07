@@ -102,6 +102,7 @@ struct StreamTuning {
     target_fps: u32,
     scale_divisor: u8,
     use_rgb565: bool,
+    last_input_time: Instant,
 }
 
 impl Default for StreamTuning {
@@ -110,6 +111,7 @@ impl Default for StreamTuning {
             target_fps: 10,
             scale_divisor: 1,
             use_rgb565: false,
+            last_input_time: Instant::now(),
         }
     }
 }
@@ -301,6 +303,7 @@ pub fn run_host(config: HostConfig, logger: Logger, stop: StopFlag) -> Result<()
             target_fps: 6,
             scale_divisor: 2,
             use_rgb565: false,
+            last_input_time: Instant::now(),
         }
     } else {
         StreamTuning::default()
@@ -891,6 +894,22 @@ fn handle_control_stream(
             frame.events.len()
         ));
         pings_unanswered = 0;
+        let is_user_input = frame.events.iter().any(|ev| {
+            matches!(
+                ev,
+                ControlEvent::MouseMove { .. }
+                    | ControlEvent::MouseMoveRelative { .. }
+                    | ControlEvent::MouseButton { .. }
+                    | ControlEvent::Key { .. }
+                    | ControlEvent::UnicodeChar { .. }
+            )
+        });
+        if is_user_input {
+            if let Ok(mut guard) = tuning.lock() {
+                guard.last_input_time = Instant::now();
+            }
+        }
+
         for event in &frame.events {
             if let ControlEvent::StreamFeedback {
                 target_fps,
@@ -1541,7 +1560,12 @@ fn handle_stream_channel(
                 Ok(guard) => *guard,
                 Err(_) => StreamTuning::default(),
             };
-            let frame_interval_ms = (1000 / tuning_snapshot.target_fps.max(1)).max(16);
+            let is_idle = tuning_snapshot.last_input_time.elapsed() >= Duration::from_secs(3);
+            let frame_interval_ms = if is_idle {
+                500 
+            } else {
+                (1000 / tuning_snapshot.target_fps.max(1)).max(16)
+            };
             let rdp_session = is_remote_desktop_session();
 
             if synthetic_fallback_enabled

@@ -15,6 +15,66 @@ use lanpilot_host::{HostConfig, StreamSource, run_host};
 
 const INTERNAL_PAIR_CODE: &str = "000000";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Language {
+    #[default]
+    Es,
+    En,
+}
+
+fn t(key: &str, lang: Language) -> &str {
+    match lang {
+        Language::Es => match key {
+            "title" => "LanPilot - Control Remoto P2P",
+            "hosting_title" => "Este equipo comparte pantalla",
+            "waiting_conn" => "Esperando conexión...",
+            "hosting_wait" => "Escanear para conectar instantáneamente:",
+            "enlace_code" => "Código de enlace:",
+            "stop" => "Detener",
+            "home_header" => "Conexión Segura P2P",
+            "options" => "Opciones Avanzadas",
+            "autostart" => "Iniciar con Windows (Elevado sin UAC)",
+            "lang_lbl" => "Idioma / Language:",
+            "host_btn" => "Compartir Pantalla",
+            "agent_btn" => "Conectarme",
+            "connecting" => "Conectando...",
+            "cancel" => "Cancelar",
+            "connected_hosts" => "Equipos disponibles en la red:",
+            "target_ip" => "IP del equipo destino:",
+            "pair_code_lbl" => "Código de enlace (6 dígitos):",
+            "log_box" => "Registro de eventos:",
+            "no_hosts" => "Buscando equipos en la red local...",
+            "favorite" => "Establecer como favorito",
+            "diagnostics" => "Mostrar diagnósticos de red",
+            _ => key,
+        },
+        Language::En => match key {
+            "title" => "LanPilot - P2P Remote Control",
+            "hosting_title" => "This computer is sharing screen",
+            "waiting_conn" => "Waiting for connection...",
+            "hosting_wait" => "Scan to connect instantly:",
+            "enlace_code" => "Link code:",
+            "stop" => "Stop",
+            "home_header" => "P2P Secure Connection",
+            "options" => "Advanced Options",
+            "autostart" => "Start with Windows (Elevated without UAC)",
+            "lang_lbl" => "Language / Idioma:",
+            "host_btn" => "Share Screen",
+            "agent_btn" => "Connect",
+            "connecting" => "Connecting...",
+            "cancel" => "Cancel",
+            "connected_hosts" => "Available computers on network:",
+            "target_ip" => "Target IP address:",
+            "pair_code_lbl" => "Link code (6 digits):",
+            "log_box" => "Event log:",
+            "no_hosts" => "Scanning for computers on local network...",
+            "favorite" => "Set as favorite",
+            "diagnostics" => "Show network diagnostics",
+            _ => key,
+        }
+    }
+}
+
 fn main() -> eframe::Result<()> {
     #[cfg(windows)]
     unsafe {
@@ -77,6 +137,7 @@ struct LanPilotApp {
     debug_log_file: Option<fs::File>,
     autostart_enabled: bool,
     auto_host_triggered: bool,
+    language: Language,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -107,15 +168,13 @@ struct ConnectionMetrics {
 
 impl Default for LanPilotApp {
     fn default() -> Self {
-        let (favorite_host_ipv4, favorite_host_name) = load_favorite_target();
+        let (favorite_host_ipv4, favorite_host_name, language) = load_settings();
         let debug_log_path = init_debug_log().ok();
         
         let mut autostart_enabled = check_autostart_task_exists();
         if autostart_enabled {
-            // Actualizar silenciosamente el registro en caso de que el ejecutable haya cambiado de ruta (update)
             let _ = set_autostart_task(true);
         } else {
-            // Registrar por primera vez
             if set_autostart_task(true).is_ok() {
                 autostart_enabled = true;
             }
@@ -147,6 +206,7 @@ impl Default for LanPilotApp {
             debug_log_file: None,
             autostart_enabled,
             auto_host_triggered,
+            language,
         }
     }
 }
@@ -344,9 +404,10 @@ impl LanPilotApp {
         if host_name != "último equipo" {
             self.favorite_host_name = Some(host_name.clone());
         }
-        if let Err(err) = save_favorite_target(
+        if let Err(err) = save_settings(
             self.favorite_host_ipv4.as_deref(),
             self.favorite_host_name.as_deref(),
+            self.language,
         ) {
             self.status_lines
                 .push(format!("No se pudo guardar equipo favorito: {err}"));
@@ -516,7 +577,7 @@ impl LanPilotApp {
         ui.vertical_centered(|ui| {
             ui.add_space(16.0);
             ui.heading(egui::RichText::new("🚀 LanPilot").strong().size(26.0));
-            ui.label("Controla y comparte pantallas de forma ultra-simple");
+            ui.label(t("title", self.language));
             
             let state_line = connection_state_from_logs(&self.status_lines);
             ui.colored_label(egui::Color32::from_rgb(150, 160, 180), state_line);
@@ -539,18 +600,18 @@ impl LanPilotApp {
                         ui.set_min_height(200.0);
                         
                         ui.add_space(12.0);
-                        ui.heading("📺 Compartir");
-                        ui.label("Permite que otros vean tu PC");
+                        ui.heading(if self.language == Language::Es { "📺 Compartir" } else { "📺 Share" });
+                        ui.label(if self.language == Language::Es { "Permite que otros vean tu PC" } else { "Allow others to view your PC" });
                         ui.add_space(16.0);
 
                         ui.horizontal(|ui| {
-                            ui.label("Tu código:");
+                            ui.label(if self.language == Language::Es { "Tu código:" } else { "Your code:" });
                             ui.add(egui::TextEdit::singleline(&mut self.pair_code).char_limit(6));
                         });
                         ui.add_space(16.0);
 
                         if ui
-                            .add_sized([180.0, 40.0], egui::Button::new("Compartir Pantalla").fill(egui::Color32::from_rgb(52, 115, 230)))
+                            .add_sized([180.0, 40.0], egui::Button::new(t("host_btn", self.language)).fill(egui::Color32::from_rgb(52, 115, 230)))
                             .clicked()
                         {
                             self.start_host();
@@ -566,33 +627,33 @@ impl LanPilotApp {
                         ui.set_min_height(200.0);
 
                         ui.add_space(12.0);
-                        ui.heading("🎮 Controlar");
-                        ui.label("Ver y manejar otro PC");
+                        ui.heading(if self.language == Language::Es { "🎮 Controlar" } else { "🎮 Control" });
+                        ui.label(if self.language == Language::Es { "Ver y manejar otro PC" } else { "View and manage other PC" });
                         ui.add_space(16.0);
 
                         ui.horizontal(|ui| {
-                            ui.label("Código del otro:");
+                            ui.label(if self.language == Language::Es { "Código del otro:" } else { "Other's code:" });
                             ui.add(egui::TextEdit::singleline(&mut self.target_code).char_limit(6));
                         });
                         ui.add_space(16.0);
 
                         if ui
-                            .add_sized([180.0, 40.0], egui::Button::new("Conectar"))
+                            .add_sized([180.0, 40.0], egui::Button::new(t("agent_btn", self.language)))
                             .clicked()
                         {
                             let code = self.target_code.trim().to_string();
                             if code.len() == 6 && code.chars().all(|c| c.is_ascii_digit()) {
                                 self.pair_code = code;
-                                self.status_lines.push("Buscando host por código...".to_string());
+                                self.status_lines.push(if self.language == Language::Es { "Buscando host por código...".to_string() } else { "Scanning target by code...".to_string() });
                                 self.search_hosts();
                                 if !self.discovered_hosts.is_empty() {
                                     self.selected_host_index = Some(0);
                                     self.start_agent();
                                 } else {
-                                    self.user_message = Some("No se encontró ningún equipo con ese código en la red local.".to_string());
+                                    self.user_message = Some(if self.language == Language::Es { "No se encontró ningún equipo con ese código en la red local.".to_string() } else { "No remote computer found with that code on local network.".to_string() });
                                 }
                             } else {
-                                self.user_message = Some("Por favor introduce un código de emparejamiento válido de 6 dígitos.".to_string());
+                                self.user_message = Some(if self.language == Language::Es { "Por favor introduce un código de emparejamiento válido de 6 dígitos.".to_string() } else { "Please enter a valid 6-digit link code.".to_string() });
                             }
                         }
                         ui.add_space(12.0);
@@ -602,13 +663,37 @@ impl LanPilotApp {
 
             ui.add_space(20.0);
 
-            // Sección Colapsable para Opciones Avanzadas (para no confundir a gente normal)
-            ui.collapsing("⚙️ Opciones avanzadas (Técnico)", |ui| {
+            // Sección Colapsable para Opciones Avanzadas
+            ui.collapsing(t("options", self.language), |ui| {
                 ui.add_space(6.0);
+                
+                // Selector interactivo de idioma
                 ui.horizontal(|ui| {
-                    ui.label("IP manual:");
+                    ui.label(t("lang_lbl", self.language));
+                    let mut current_lang = self.language;
+                    if ui.selectable_value(&mut current_lang, Language::Es, "Español").changed() {
+                        self.language = current_lang;
+                        let _ = save_settings(
+                            self.favorite_host_ipv4.as_deref(),
+                            self.favorite_host_name.as_deref(),
+                            self.language,
+                        );
+                    }
+                    if ui.selectable_value(&mut current_lang, Language::En, "English").changed() {
+                        self.language = current_lang;
+                        let _ = save_settings(
+                            self.favorite_host_ipv4.as_deref(),
+                            self.favorite_host_name.as_deref(),
+                            self.language,
+                        );
+                    }
+                });
+                ui.add_space(8.0);
+
+                ui.horizontal(|ui| {
+                    ui.label(if self.language == Language::Es { "IP manual:" } else { "Manual IP:" });
                     ui.text_edit_singleline(&mut self.manual_ip);
-                    if ui.button("Conectar por IP").clicked() {
+                    if ui.button(if self.language == Language::Es { "Conectar por IP" } else { "Connect by IP" }).clicked() {
                         let ip = self.manual_ip.trim().to_string();
                         if !ip.is_empty() {
                             self.start_agent_for_target("IP Directa".to_string(), ip);
@@ -620,18 +705,18 @@ impl LanPilotApp {
                 #[cfg(windows)]
                 {
                     let mut autostart = self.autostart_enabled;
-                    if ui.checkbox(&mut autostart, "Iniciar Host automáticamente al encender PC (elevado sin UAC)").changed() {
+                    if ui.checkbox(&mut autostart, t("autostart", self.language)).changed() {
                         match set_autostart_task(autostart) {
                             Ok(()) => {
                                 self.autostart_enabled = autostart;
                                 if autostart {
-                                    self.status_lines.push("Inicio automático (elevado) activado con éxito.".to_string());
+                                    self.status_lines.push(if self.language == Language::Es { "Inicio automático (elevado) activado con éxito.".to_string() } else { "Auto start (elevated) activated successfully.".to_string() });
                                 } else {
-                                    self.status_lines.push("Inicio automático desactivado.".to_string());
+                                    self.status_lines.push(if self.language == Language::Es { "Inicio automático desactivado.".to_string() } else { "Auto start deactivated.".to_string() });
                                 }
                             }
                             Err(err) => {
-                                self.user_message = Some(format!("Error de inicio automático: {}", err));
+                                self.user_message = Some(format!("Error: {}", err));
                             }
                         }
                     }
@@ -640,13 +725,13 @@ impl LanPilotApp {
 
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Refrescar equipos").clicked() {
+                    if ui.button(if self.language == Language::Es { "Refrescar equipos" } else { "Refresh hosts" }).clicked() {
                         self.search_hosts();
                     }
-                    if ui.button("Diagnóstico").clicked() {
+                    if ui.button(if self.language == Language::Es { "Diagnóstico" } else { "Diagnostics" }).clicked() {
                         self.run_diagnostics();
                     }
-                    if self.favorite_host_ipv4.is_some() && ui.button("Reconectar último").clicked() {
+                    if self.favorite_host_ipv4.is_some() && ui.button(if self.language == Language::Es { "Reconectar último" } else { "Reconnect last" }).clicked() {
                         self.reconnect_favorite();
                     }
                 });
@@ -658,10 +743,10 @@ impl LanPilotApp {
                         .selected_host_index
                         .and_then(|idx| self.discovered_hosts.get(idx))
                         .map(|host| host_display_name(host, duplicate_names.contains(&host.host_name)))
-                        .unwrap_or_else(|| "Selecciona un equipo".to_string());
+                        .unwrap_or_else(|| (if self.language == Language::Es { "Selecciona un equipo" } else { "Select a target" }).to_string());
 
                     ui.horizontal(|ui| {
-                        egui::ComboBox::from_label("Equipos en LAN")
+                        egui::ComboBox::from_label(t("connected_hosts", self.language))
                             .selected_text(selected_text)
                             .width(200.0)
                             .show_ui(ui, |ui| {
@@ -673,7 +758,7 @@ impl LanPilotApp {
                                     );
                                 }
                             });
-                        if ui.button("Conectar").clicked() {
+                        if ui.button(if self.language == Language::Es { "Conectar" } else { "Connect" }).clicked() {
                             self.start_agent();
                         }
                     });
@@ -692,7 +777,7 @@ impl LanPilotApp {
             ui.add_space(12.0);
             if !self.status_lines.is_empty() {
                 ui.separator();
-                ui.label(egui::RichText::new("Registro de estado:").strong());
+                ui.label(egui::RichText::new(t("log_box", self.language)).strong());
                 for line in self.status_lines.iter().rev().take(3).rev() {
                     ui.label(egui::RichText::new(line).size(11.0).color(egui::Color32::from_rgb(160, 170, 180)));
                 }
@@ -886,24 +971,28 @@ fn settings_file_path() -> Option<PathBuf> {
     Some(path)
 }
 
-fn load_favorite_target() -> (Option<String>, Option<String>) {
+fn load_settings() -> (Option<String>, Option<String>, Language) {
     let Some(path) = settings_file_path() else {
-        return (None, None);
+        return (None, None, Language::Es);
     };
     let Ok(contents) = fs::read_to_string(path) else {
-        return (None, None);
+        return (None, None, Language::Es);
     };
     let value = contents.trim();
     if value.is_empty() {
-        return (None, None);
+        return (None, None, Language::Es);
     }
-    let mut parts = value.splitn(2, '|');
-    let ip = parts.next().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
-    let name = parts.next().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
-    (ip, name)
+    let parts: Vec<&str> = value.split('|').collect();
+    let ip = parts.get(0).map(|s| s.trim()).filter(|s| !s.is_empty()).map(|s| s.to_string());
+    let name = parts.get(1).map(|s| s.trim()).filter(|s| !s.is_empty()).map(|s| s.to_string());
+    let lang = match parts.get(2).map(|s| s.trim()) {
+        Some("en") => Language::En,
+        _ => Language::Es,
+    };
+    (ip, name, lang)
 }
 
-fn save_favorite_target(ipv4: Option<&str>, host_name: Option<&str>) -> Result<(), String> {
+fn save_settings(ipv4: Option<&str>, host_name: Option<&str>, lang: Language) -> Result<(), String> {
     let Some(path) = settings_file_path() else {
         return Err("APPDATA no está disponible".to_string());
     };
@@ -913,7 +1002,11 @@ fn save_favorite_target(ipv4: Option<&str>, host_name: Option<&str>) -> Result<(
     fs::create_dir_all(parent).map_err(|err| format!("crear carpeta de configuración falló: {err}"))?;
     let ip = ipv4.unwrap_or("").trim();
     let name = host_name.unwrap_or("").trim();
-    fs::write(path, format!("{ip}|{name}\n")).map_err(|err| format!("guardar favorito falló: {err}"))
+    let lang_str = match lang {
+        Language::En => "en",
+        Language::Es => "es",
+    };
+    fs::write(path, format!("{ip}|{name}|{lang_str}\n")).map_err(|err| format!("guardar configuración falló: {err}"))
 }
 
 fn humanize_error(err: &str) -> String {
