@@ -1500,7 +1500,7 @@ fn handle_stream_channel(
             }
         });
     }
-    let recovery_probe_interval = capture_recovery_probe_interval(rdp_session);
+    let _recovery_probe_interval = capture_recovery_probe_interval(rdp_session);
     let mut synthetic_fallback_enabled = false;
     let capture = match stream_source {
         StreamSource::Synthetic => {
@@ -1570,9 +1570,7 @@ fn handle_stream_channel(
 
             if synthetic_fallback_enabled
                 && stream_source == StreamSource::Screen
-                && sequence > 0
-                && sequence % recovery_probe_interval == 0
-                && last_compat_probe.elapsed() >= CAPTURE_RECOVERY_PROBE_MIN_ELAPSED
+                && last_compat_probe.elapsed() >= Duration::from_secs(2)
             {
                 last_compat_probe = Instant::now();
                 compat_probe_attempts += 1;

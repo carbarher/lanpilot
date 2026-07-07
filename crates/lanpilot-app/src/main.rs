@@ -978,7 +978,7 @@ fn load_settings() -> (Option<String>, Option<String>, Language) {
     let Ok(contents) = fs::read_to_string(path) else {
         return (None, None, Language::Es);
     };
-    let value = contents.trim();
+    let value = contents.lines().next().unwrap_or("").trim();
     if value.is_empty() {
         return (None, None, Language::Es);
     }

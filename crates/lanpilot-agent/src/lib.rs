@@ -2319,11 +2319,11 @@ fn spawn_audio_client(host_ipv4: String, stop: StopFlag, logger: Logger, pair_co
                             let t = phase as f32;
                             let get_sample = |buf: &std::collections::VecDeque<i16>, ch: usize, t_val: f32| -> f32 {
                                 if buf.len() >= host_channels * 2 {
-                                    let s_prev = buf[ch] as f32 / 32767.0;
-                                    let s_next = buf[host_channels + ch] as f32 / 32767.0;
+                                    let s_prev = buf.get(ch).map(|&v| v as f32).unwrap_or(0.0) / 32767.0;
+                                    let s_next = buf.get(host_channels + ch).map(|&v| v as f32).unwrap_or(0.0) / 32767.0;
                                     s_prev + (s_next - s_prev) * t_val
                                 } else if !buf.is_empty() {
-                                    buf[ch % buf.len()] as f32 / 32767.0
+                                    buf.get(ch % buf.len()).map(|&v| v as f32).unwrap_or(0.0) / 32767.0
                                 } else {
                                     0.0
                                 }
