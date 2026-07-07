@@ -1126,7 +1126,7 @@ fn run_phase3_stream_channel(
                                 use std::io::BufRead;
                                 use std::io::Seek;
                                 
-                                let mut buffer = vec![0u8; 131072];
+                                let mut buffer = vec![0u8; 32768];
                                 let mut offset = 0_u64;
                                 let mut acked_offset = 0_u64;
                                 let mut in_flight = std::collections::VecDeque::new();
@@ -1153,6 +1153,7 @@ fn run_phase3_stream_channel(
                                                     let encrypted = lanpilot_core::encrypt_line(&line, &mut guard.1);
                                                     let _ = guard.0.write_all(encrypted.as_bytes());
                                                 }
+                                                std::thread::sleep(std::time::Duration::from_millis(5));
                                                 in_flight.push_back((offset, n as u64));
                                                 offset += n as u64;
                                             }
@@ -1258,6 +1259,15 @@ fn run_phase3_stream_channel(
                         stream = new_s;
                         control_stream = new_c;
                         reader = new_r;
+                        
+                        stream_cipher_rx = lanpilot_core::Rc4Cipher::new(format!("{}-stream-h2c", config.pair_code).as_bytes());
+                        stream_cipher_tx = lanpilot_core::Rc4Cipher::new(format!("{}-stream-c2h", config.pair_code).as_bytes());
+                        let new_control_tx = lanpilot_core::Rc4Cipher::new(format!("{}-control-c2h", config.pair_code).as_bytes());
+                        if let Ok(mut guard) = control_tx_mutex.lock() {
+                            guard.0 = control_stream.try_clone().unwrap();
+                            guard.1 = new_control_tx;
+                        }
+
                         last_frame_received_at = std::time::Instant::now();
                         timeout_streak = 0;
                         continue;
@@ -1273,6 +1283,15 @@ fn run_phase3_stream_channel(
                     stream = new_s;
                     control_stream = new_c;
                     reader = new_r;
+                    
+                    stream_cipher_rx = lanpilot_core::Rc4Cipher::new(format!("{}-stream-h2c", config.pair_code).as_bytes());
+                    stream_cipher_tx = lanpilot_core::Rc4Cipher::new(format!("{}-stream-c2h", config.pair_code).as_bytes());
+                    let new_control_tx = lanpilot_core::Rc4Cipher::new(format!("{}-control-c2h", config.pair_code).as_bytes());
+                    if let Ok(mut guard) = control_tx_mutex.lock() {
+                        guard.0 = control_stream.try_clone().unwrap();
+                        guard.1 = new_control_tx;
+                    }
+
                     last_frame_received_at = std::time::Instant::now();
                     timeout_streak = 0;
                     continue;

@@ -1007,23 +1007,26 @@ pub fn write_rich_clipboard(format_name: &str, data: &[u8]) -> Result<(), String
         unsafe extern "system" {
             fn OpenClipboard(hWndNewOwner: *mut std::ffi::c_void) -> i32;
             fn CloseClipboard() -> i32;
+            fn EmptyClipboard() -> i32;
             fn SetClipboardData(uFormat: u32, hMem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
             fn RegisterClipboardFormatA(lpszFormat: *const u8) -> u32;
         }
         #[link(name = "kernel32")]
         unsafe extern "system" {
             fn GlobalAlloc(uFlags: u32, dwBytes: usize) -> *mut std::ffi::c_void;
+            fn GlobalFree(hMem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
             fn GlobalLock(hMem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
             fn GlobalUnlock(hMem: *mut std::ffi::c_void) -> i32;
         }
-
+ 
         let fmt_cstr = std::ffi::CString::new(format_name).map_err(|e| e.to_string())?;
         let format_id = RegisterClipboardFormatA(fmt_cstr.as_ptr() as *const u8);
         if format_id == 0 {
             return Err("No se pudo registrar el formato de clipboard".to_string());
         }
-
+ 
         if OpenClipboard(std::ptr::null_mut()) != 0 {
+            let _ = EmptyClipboard();
             let handle = GlobalAlloc(0x0002, data.len() + 1); // GMEM_MOVEABLE = 0x0002
             if !handle.is_null() {
                 let ptr = GlobalLock(handle);
@@ -1032,7 +1035,12 @@ pub fn write_rich_clipboard(format_name: &str, data: &[u8]) -> Result<(), String
                     dst_slice[..data.len()].copy_from_slice(data);
                     dst_slice[data.len()] = 0;
                     GlobalUnlock(handle);
-                    SetClipboardData(format_id, handle);
+                    let res = SetClipboardData(format_id, handle);
+                    if res.is_null() {
+                        GlobalFree(handle);
+                    }
+                } else {
+                    GlobalFree(handle);
                 }
             }
             CloseClipboard();
