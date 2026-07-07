@@ -1365,8 +1365,7 @@ fn run_phase3_stream_channel(
         let decrypted_line = match lanpilot_core::decrypt_line(&line, &mut stream_cipher_rx) {
             Ok(d) => d,
             Err(err) => {
-                logger.log(format!("stream decrypt error: {err}"));
-                continue;
+                return Err(format!("stream decrypt error: {err}"));
             }
         };
 

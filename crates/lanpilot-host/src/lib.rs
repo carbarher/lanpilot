@@ -863,7 +863,7 @@ fn handle_control_stream(
             Ok(d) => d,
             Err(err) => {
                 logger.log(format!("control decrypt error from {peer}: {err}"));
-                continue;
+                break;
             }
         };
 
