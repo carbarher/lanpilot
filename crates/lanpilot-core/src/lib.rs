@@ -7,6 +7,44 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
+pub fn is_private_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ipv4) => {
+            let octets = ipv4.octets();
+            if octets[0] == 127 {
+                return true;
+            }
+            if octets[0] == 10 {
+                return true;
+            }
+            if octets[0] == 172 && (octets[1] >= 16 && octets[1] <= 31) {
+                return true;
+            }
+            if octets[0] == 192 && octets[1] == 168 {
+                return true;
+            }
+            if octets[0] == 169 && octets[1] == 254 {
+                return true;
+            }
+            false
+        }
+        IpAddr::V6(ipv6) => {
+            let segments = ipv6.segments();
+            if segments == [0, 0, 0, 0, 0, 0, 0, 1] {
+                return true;
+            }
+            let high_byte = (segments[0] >> 8) as u8;
+            if (high_byte & 0xFE) == 0xFC {
+                return true;
+            }
+            if (segments[0] & 0xFFC0) == 0xFE80 {
+                return true;
+            }
+            false
+        }
+    }
+}
+
 // ── Logger ───────────────────────────────────────────────────────────────────
 
 /// A cheaply-clonable status callback used by the host/agent runtime
@@ -66,6 +104,7 @@ pub const DISCOVERY_PORT: u16 = 47042;
 pub const HANDSHAKE_PORT: u16 = 47043;
 pub const CONTROL_PORT: u16 = 47044;
 pub const STREAM_PORT: u16 = 47045;
+pub const AUDIO_PORT: u16 = 47046;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeIdentity {
@@ -201,6 +240,10 @@ pub enum ControlEvent {
         dx: i32,
         dy: i32,
     },
+    MouseMoveRelative {
+        dx: i32,
+        dy: i32,
+    },
     MouseButton {
         button: String,
         pressed: bool,
@@ -214,6 +257,45 @@ pub enum ControlEvent {
         scale_divisor: u8,
         avg_latency_ms: u32,
         jitter_ms: u32,
+        echo_captured_at_ms: u64,
+    },
+    Clipboard {
+        text: String,
+    },
+    KeyLockState {
+        caps_lock: bool,
+        num_lock: bool,
+    },
+    CycleMonitor,
+    FileChunk {
+        filename: String,
+        offset: u64,
+        total_size: u64,
+        data_b64: String,
+    },
+    SetVideoFormat {
+        use_rgb565: bool,
+    },
+    UnicodeChar {
+        ch: String,
+    },
+    ClipboardImage {
+        width: usize,
+        height: usize,
+        rgba_payload_b64: String,
+    },
+    Ping {
+        timestamp_ms: u64,
+    },
+    Pong {
+        timestamp_ms: u64,
+    },
+    TogglePrivacyMode {
+        enabled: bool,
+    },
+    FileChunkAck {
+        filename: String,
+        offset: u64,
     },
 }
 
@@ -254,6 +336,16 @@ impl StreamHello {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tile {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+    pub compressed_payload_b64: String,
+    pub raw_len: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamFrame {
     pub magic: String,
     pub session_id: String,
@@ -268,6 +360,7 @@ pub struct StreamFrame {
     pub compressed_payload_b64: String,
     pub raw_len: usize,
     pub source: String,
+    pub tiles: Option<Vec<Tile>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -295,6 +388,7 @@ impl StreamFrame {
             compressed_payload_b64: String::new(),
             raw_len: width as usize * height as usize * 4,
             source: "synthetic".to_string(),
+            tiles: None,
         }
     }
 }
@@ -465,6 +559,82 @@ pub fn log_session_event(event: &SessionEvent) {
     println!("{}", session_event_json(event));
 }
 
+const INDEX_TABLE: [i16; 16] = [
+    -1, -1, -1, -1, 2, 4, 6, 8,
+    -1, -1, -1, -1, 2, 4, 6, 8,
+];
+
+const STEP_TABLE: [i16; 89] = [
+    7, 8, 9, 10, 11, 12, 13, 14, 16, 17,
+    19, 21, 23, 25, 28, 31, 34, 37, 41, 45,
+    50, 55, 60, 66, 73, 80, 88, 97, 107, 118,
+    130, 143, 157, 173, 190, 209, 230, 253, 279, 307,
+    337, 371, 408, 449, 494, 544, 598, 658, 724, 796,
+    876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066,
+    2272, 2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358,
+    5894, 6484, 7132, 7845, 8630, 9493, 10442, 11487, 12635, 13899,
+    15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767,
+];
+
+pub fn adpcm_encode_sample(sample: i16, predictor: &mut i32, step_index: &mut i32) -> u8 {
+    let step = STEP_TABLE[*step_index as usize] as i32;
+    let mut diff = sample as i32 - *predictor;
+    let mut code = 0;
+    if diff < 0 {
+        code = 8;
+        diff = -diff;
+    }
+    let mut tempstep = step;
+    if diff >= tempstep {
+        code |= 4;
+        diff -= tempstep;
+    }
+    tempstep >>= 1;
+    if diff >= tempstep {
+        code |= 2;
+        diff -= tempstep;
+    }
+    tempstep >>= 1;
+    if diff >= tempstep {
+        code |= 1;
+    }
+    
+    let mut vpdiff = step >> 3;
+    if (code & 4) != 0 { vpdiff += step; }
+    if (code & 2) != 0 { vpdiff += step >> 1; }
+    if (code & 1) != 0 { vpdiff += step >> 2; }
+    if (code & 8) != 0 {
+        *predictor -= vpdiff;
+    } else {
+        *predictor += vpdiff;
+    }
+    *predictor = (*predictor).clamp(-32768, 32767);
+    
+    *step_index += INDEX_TABLE[(code & 15) as usize] as i32;
+    *step_index = (*step_index).clamp(0, 88);
+    
+    code as u8
+}
+
+pub fn adpcm_decode_sample(code: u8, predictor: &mut i32, step_index: &mut i32) -> i16 {
+    let step = STEP_TABLE[*step_index as usize] as i32;
+    let mut vpdiff = step >> 3;
+    if (code & 4) != 0 { vpdiff += step; }
+    if (code & 2) != 0 { vpdiff += step >> 1; }
+    if (code & 1) != 0 { vpdiff += step >> 2; }
+    if (code & 8) != 0 {
+        *predictor -= vpdiff;
+    } else {
+        *predictor += vpdiff;
+    }
+    *predictor = (*predictor).clamp(-32768, 32767);
+    
+    *step_index += INDEX_TABLE[(code & 15) as usize] as i32;
+    *step_index = (*step_index).clamp(0, 88);
+    
+    *predictor as i16
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -539,6 +709,7 @@ mod tests {
                     scale_divisor: 2,
                     avg_latency_ms: 190,
                     jitter_ms: 85,
+                    echo_captured_at_ms: 1234567890,
                 },
             ],
         );

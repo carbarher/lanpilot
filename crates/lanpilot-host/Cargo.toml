@@ -7,14 +7,13 @@ edition = "2024"
 name = "lanpilot_host"
 path = "src/lib.rs"
 
-[[bin]]
-name = "lanpilot-host"
-path = "src/main.rs"
-
 [dependencies]
 base64 = "0.22"
+chrono = "0.4"
 lanpilot-core = { path = "../lanpilot-core" }
 lz4_flex = "0.11"
+arboard = "3.6"
+cpal = "0.15"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [

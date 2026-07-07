@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -14,6 +16,15 @@ use lanpilot_host::{HostConfig, StreamSource, run_host};
 const INTERNAL_PAIR_CODE: &str = "000000";
 
 fn main() -> eframe::Result<()> {
+    #[cfg(windows)]
+    unsafe {
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn SetProcessDPIAware() -> i32;
+        }
+        let _ = SetProcessDPIAware();
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([520.0, 420.0])
@@ -24,7 +35,21 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "LanPilot",
         options,
-        Box::new(|_cc| Ok(Box::<LanPilotApp>::default())),
+        Box::new(|cc| {
+            let mut visuals = egui::Visuals::dark();
+            visuals.window_rounding = 12.0.into();
+            visuals.widgets.noninteractive.rounding = 8.0.into();
+            visuals.widgets.inactive.rounding = 8.0.into();
+            visuals.widgets.hovered.rounding = 8.0.into();
+            visuals.widgets.active.rounding = 8.0.into();
+            
+            visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(26, 29, 36);
+            visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(38, 43, 54);
+            visuals.widgets.active.bg_fill = egui::Color32::from_rgb(52, 115, 230);
+            
+            cc.egui_ctx.set_visuals(visuals);
+            Ok(Box::<LanPilotApp>::default())
+        }),
     )
 }
 
@@ -46,6 +71,12 @@ struct LanPilotApp {
     connection_metrics: ConnectionMetrics,
     debug_log_path: Option<PathBuf>,
     debug_log_failed: bool,
+    manual_ip: String,
+    pair_code: String,
+    target_code: String,
+    debug_log_file: Option<fs::File>,
+    autostart_enabled: bool,
+    auto_host_triggered: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +109,20 @@ impl Default for LanPilotApp {
     fn default() -> Self {
         let (favorite_host_ipv4, favorite_host_name) = load_favorite_target();
         let debug_log_path = init_debug_log().ok();
+        
+        let mut autostart_enabled = check_autostart_task_exists();
+        if autostart_enabled {
+            // Actualizar silenciosamente el registro en caso de que el ejecutable haya cambiado de ruta (update)
+            let _ = set_autostart_task(true);
+        } else {
+            // Registrar por primera vez
+            if set_autostart_task(true).is_ok() {
+                autostart_enabled = true;
+            }
+        }
+        
+        let auto_host_triggered = std::env::args().any(|arg| arg == "--host");
+        
         Self {
             screen: Screen::Home,
             status_lines: Vec::new(),
@@ -96,6 +141,12 @@ impl Default for LanPilotApp {
             connection_metrics: ConnectionMetrics::default(),
             debug_log_path,
             debug_log_failed: false,
+            manual_ip: String::new(),
+            pair_code: INTERNAL_PAIR_CODE.to_string(),
+            target_code: String::new(),
+            debug_log_file: None,
+            autostart_enabled,
+            auto_host_triggered,
         }
     }
 }
@@ -112,7 +163,7 @@ impl LanPilotApp {
         let host_name = std::env::var("COMPUTERNAME").ok();
         let config = HostConfig {
             host_name,
-            pair_code: Some(INTERNAL_PAIR_CODE.to_string()),
+            pair_code: Some(self.pair_code.clone()),
             stream_source: StreamSource::Screen,
             max_stream_frames: u64::MAX,
         };
@@ -138,7 +189,7 @@ impl LanPilotApp {
         self.status_lines.clear();
         self.status_lines
             .push("Buscando equipos disponibles en la red local...".to_string());
-        match discover_hosts(INTERNAL_PAIR_CODE) {
+        match discover_hosts(&self.pair_code) {
             Ok(hosts) => {
                 self.discovered_hosts = hosts;
                 self.selected_host_index = self.preferred_host_index();
@@ -182,7 +233,7 @@ impl LanPilotApp {
             self.diagnostics_lines
                 .push(format!("Log debug provisional: {}", path.display()));
         }
-        match discover_hosts(INTERNAL_PAIR_CODE) {
+        match discover_hosts(&self.pair_code) {
             Ok(hosts) => {
                 self.diagnostics_lines.push(format!(
                     "Hosts detectados en LAN: {}",
@@ -269,7 +320,7 @@ impl LanPilotApp {
         let logger = Logger::new(move |line| {
             let _ = tx.send(line);
         });
-        let mut config = AgentConfig::with_pair_code(INTERNAL_PAIR_CODE);
+        let mut config = AgentConfig::with_pair_code(&self.pair_code);
         // GUI mode should keep the session open until the user presses "Detener".
         config.target_stream_frames = 0;
         config.preferred_host_ipv4 = Some(host_ipv4.clone());
@@ -338,29 +389,34 @@ impl LanPilotApp {
     }
 
     fn append_debug_log_line(&mut self, line: &str) {
+        if self.debug_log_failed {
+            return;
+        }
         let Some(path) = self.debug_log_path.clone() else {
             return;
         };
-        let mut file = match OpenOptions::new().create(true).append(true).open(&path) {
-            Ok(file) => file,
-            Err(err) => {
-                if !self.debug_log_failed {
+        if self.debug_log_file.is_none() {
+            match OpenOptions::new().create(true).append(true).open(&path) {
+                Ok(file) => self.debug_log_file = Some(file),
+                Err(err) => {
                     self.status_lines
                         .push(format!("No se pudo abrir log debug provisional: {err}"));
                     self.debug_log_failed = true;
+                    return;
                 }
-                return;
             }
-        };
-        let ts_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or_default();
-        if let Err(err) = writeln!(file, "[{ts_ms}] {line}") {
-            if !self.debug_log_failed {
+        }
+        if let Some(ref mut file) = self.debug_log_file {
+            let ts_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or_default();
+            if let Err(err) = writeln!(file, "[{ts_ms}] {line}") {
                 self.status_lines
                     .push(format!("No se pudo escribir en log debug provisional: {err}"));
                 self.debug_log_failed = true;
+            } else {
+                let _ = file.flush();
             }
         }
     }
@@ -398,6 +454,7 @@ impl LanPilotApp {
         }
     }
 
+    #[allow(dead_code)]
     fn quick_connect(&mut self) {
         self.user_message = None;
         if self.discovered_hosts.is_empty() {
@@ -458,107 +515,186 @@ impl LanPilotApp {
     fn draw_home(&mut self, ui: &mut egui::Ui) {
         ui.vertical_centered(|ui| {
             ui.add_space(16.0);
-            ui.heading("LanPilot");
-            ui.label("Control remoto LAN muy simple");
+            ui.heading(egui::RichText::new("🚀 LanPilot").strong().size(26.0));
+            ui.label("Controla y comparte pantallas de forma ultra-simple");
+            
             let state_line = connection_state_from_logs(&self.status_lines);
-            ui.label(state_line);
+            ui.colored_label(egui::Color32::from_rgb(150, 160, 180), state_line);
+
             if let Some(message) = &self.user_message {
                 ui.add_space(8.0);
                 ui.colored_label(
-                    egui::Color32::from_rgb(255, 214, 102),
-                    egui::RichText::new(message).strong().size(18.0),
+                    egui::Color32::from_rgb(255, 110, 110),
+                    egui::RichText::new(message).strong().size(14.0),
                 );
             }
             ui.add_space(20.0);
 
-            if ui
-                .add_sized([260.0, 52.0], egui::Button::new("Compartir mi pantalla"))
-                .clicked()
-            {
-                self.start_host();
-            }
-            ui.label("Este equipo queda esperando conexión.");
+            // Layout de 2 columnas claras: Compartir (Izquierda) y Conectar (Derecha)
+            ui.columns(2, |columns| {
+                // Columna 1: Compartir Pantalla (Host)
+                columns[0].vertical_centered(|ui| {
+                    ui.group(|ui| {
+                        ui.set_min_width(220.0);
+                        ui.set_min_height(200.0);
+                        
+                        ui.add_space(12.0);
+                        ui.heading("📺 Compartir");
+                        ui.label("Permite que otros vean tu PC");
+                        ui.add_space(16.0);
 
-            ui.add_space(12.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Tu código:");
+                            ui.add(egui::TextEdit::singleline(&mut self.pair_code).char_limit(6));
+                        });
+                        ui.add_space(16.0);
 
-            ui.group(|ui| {
-                ui.set_min_width(320.0);
-                ui.label("Conectarme a otro equipo");
-                ui.label("Busca equipos por nombre y elige uno.");
+                        if ui
+                            .add_sized([180.0, 40.0], egui::Button::new("Compartir Pantalla").fill(egui::Color32::from_rgb(52, 115, 230)))
+                            .clicked()
+                        {
+                            self.start_host();
+                        }
+                        ui.add_space(12.0);
+                    });
+                });
+
+                // Columna 2: Controlar a Otro (Agente)
+                columns[1].vertical_centered(|ui| {
+                    ui.group(|ui| {
+                        ui.set_min_width(220.0);
+                        ui.set_min_height(200.0);
+
+                        ui.add_space(12.0);
+                        ui.heading("🎮 Controlar");
+                        ui.label("Ver y manejar otro PC");
+                        ui.add_space(16.0);
+
+                        ui.horizontal(|ui| {
+                            ui.label("Código del otro:");
+                            ui.add(egui::TextEdit::singleline(&mut self.target_code).char_limit(6));
+                        });
+                        ui.add_space(16.0);
+
+                        if ui
+                            .add_sized([180.0, 40.0], egui::Button::new("Conectar"))
+                            .clicked()
+                        {
+                            let code = self.target_code.trim().to_string();
+                            if code.len() == 6 && code.chars().all(|c| c.is_ascii_digit()) {
+                                self.pair_code = code;
+                                self.status_lines.push("Buscando host por código...".to_string());
+                                self.search_hosts();
+                                if !self.discovered_hosts.is_empty() {
+                                    self.selected_host_index = Some(0);
+                                    self.start_agent();
+                                } else {
+                                    self.user_message = Some("No se encontró ningún equipo con ese código en la red local.".to_string());
+                                }
+                            } else {
+                                self.user_message = Some("Por favor introduce un código de emparejamiento válido de 6 dígitos.".to_string());
+                            }
+                        }
+                        ui.add_space(12.0);
+                    });
+                });
+            });
+
+            ui.add_space(20.0);
+
+            // Sección Colapsable para Opciones Avanzadas (para no confundir a gente normal)
+            ui.collapsing("⚙️ Opciones avanzadas (Técnico)", |ui| {
                 ui.add_space(6.0);
-                if ui
-                    .add_sized([240.0, 32.0], egui::Button::new("Buscar equipos"))
-                    .clicked()
-                {
-                    self.search_hosts();
-                }
-                if ui
-                    .add_sized([240.0, 32.0], egui::Button::new("Conexión rápida (1 clic)"))
-                    .clicked()
-                {
-                    self.quick_connect();
-                }
-                if self.favorite_host_ipv4.is_some()
-                    && ui
-                        .add_sized([240.0, 28.0], egui::Button::new("Reconectar al último equipo"))
-                        .clicked()
-                {
-                    self.reconnect_favorite();
-                }
-                ui.add_space(6.0);
-                if ui
-                    .add_sized([240.0, 28.0], egui::Button::new("Diagnóstico"))
-                    .clicked()
-                {
-                    self.run_diagnostics();
-                }
+                ui.horizontal(|ui| {
+                    ui.label("IP manual:");
+                    ui.text_edit_singleline(&mut self.manual_ip);
+                    if ui.button("Conectar por IP").clicked() {
+                        let ip = self.manual_ip.trim().to_string();
+                        if !ip.is_empty() {
+                            self.start_agent_for_target("IP Directa".to_string(), ip);
+                        }
+                    }
+                });
+
                 ui.add_space(8.0);
-                if self.discovered_hosts.is_empty() {
-                    ui.label("Aún no hay equipos encontrados.");
-                } else {
+                #[cfg(windows)]
+                {
+                    let mut autostart = self.autostart_enabled;
+                    if ui.checkbox(&mut autostart, "Iniciar Host automáticamente al encender PC (elevado sin UAC)").changed() {
+                        match set_autostart_task(autostart) {
+                            Ok(()) => {
+                                self.autostart_enabled = autostart;
+                                if autostart {
+                                    self.status_lines.push("Inicio automático (elevado) activado con éxito.".to_string());
+                                } else {
+                                    self.status_lines.push("Inicio automático desactivado.".to_string());
+                                }
+                            }
+                            Err(err) => {
+                                self.user_message = Some(format!("Error de inicio automático: {}", err));
+                            }
+                        }
+                    }
+                    ui.add_space(4.0);
+                }
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Refrescar equipos").clicked() {
+                        self.search_hosts();
+                    }
+                    if ui.button("Diagnóstico").clicked() {
+                        self.run_diagnostics();
+                    }
+                    if self.favorite_host_ipv4.is_some() && ui.button("Reconectar último").clicked() {
+                        self.reconnect_favorite();
+                    }
+                });
+
+                if !self.discovered_hosts.is_empty() {
+                    ui.add_space(8.0);
                     let duplicate_names = duplicate_host_names(&self.discovered_hosts);
                     let selected_text = self
                         .selected_host_index
                         .and_then(|idx| self.discovered_hosts.get(idx))
                         .map(|host| host_display_name(host, duplicate_names.contains(&host.host_name)))
                         .unwrap_or_else(|| "Selecciona un equipo".to_string());
-                    egui::ComboBox::from_label("Equipo remoto")
-                        .selected_text(selected_text)
-                        .width(280.0)
-                        .show_ui(ui, |ui| {
-                            for (idx, host) in self.discovered_hosts.iter().enumerate() {
-                                ui.selectable_value(
-                                    &mut self.selected_host_index,
-                                    Some(idx),
-                                    host_display_name(host, duplicate_names.contains(&host.host_name)),
-                                );
-                            }
-                        });
-                    ui.add_space(6.0);
-                    if ui
-                        .add_sized([240.0, 32.0], egui::Button::new("Conectarme"))
-                        .clicked()
-                    {
-                        self.start_agent();
-                    }
+
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_label("Equipos en LAN")
+                            .selected_text(selected_text)
+                            .width(200.0)
+                            .show_ui(ui, |ui| {
+                                for (idx, host) in self.discovered_hosts.iter().enumerate() {
+                                    ui.selectable_value(
+                                        &mut self.selected_host_index,
+                                        Some(idx),
+                                        host_display_name(host, duplicate_names.contains(&host.host_name)),
+                                    );
+                                }
+                            });
+                        if ui.button("Conectar").clicked() {
+                            self.start_agent();
+                        }
+                    });
+                }
+
+                if self.show_diagnostics && !self.diagnostics_lines.is_empty() {
+                    ui.add_space(8.0);
+                    ui.group(|ui| {
+                        for line in &self.diagnostics_lines {
+                            ui.label(line);
+                        }
+                    });
                 }
             });
 
-            if self.show_diagnostics && !self.diagnostics_lines.is_empty() {
-                ui.add_space(12.0);
-                ui.group(|ui| {
-                    ui.set_min_width(360.0);
-                    for line in &self.diagnostics_lines {
-                        ui.label(line);
-                    }
-                });
-            }
-
-            ui.add_space(20.0);
+            ui.add_space(12.0);
             if !self.status_lines.is_empty() {
                 ui.separator();
-                for line in self.status_lines.iter().rev().take(4).rev() {
-                    ui.label(line);
+                ui.label(egui::RichText::new("Registro de estado:").strong());
+                for line in self.status_lines.iter().rev().take(3).rev() {
+                    ui.label(egui::RichText::new(line).size(11.0).color(egui::Color32::from_rgb(160, 170, 180)));
                 }
             }
         });
@@ -640,6 +776,11 @@ impl LanPilotApp {
 
 impl eframe::App for LanPilotApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.auto_host_triggered {
+            self.auto_host_triggered = false;
+            self.start_host();
+        }
+
         self.drain_logs();
         self.worker_finished();
 
@@ -910,4 +1051,59 @@ mod tests {
         assert_eq!(parse_metric_u64(line, "candidates="), Some(4));
         assert_eq!(parse_metric_u64(line, "missing="), None);
     }
+}
+
+#[cfg(windows)]
+fn check_autostart_task_exists() -> bool {
+    use std::os::windows::process::CommandExt;
+    std::process::Command::new("schtasks")
+        .args(&["/query", "/tn", "LanPilotAutoStart"])
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(windows))]
+fn check_autostart_task_exists() -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn set_autostart_task(enable: bool) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    if enable {
+        let current_exe = std::env::current_exe()
+            .map_err(|e| format!("No se pudo obtener la ruta del ejecutable: {e}"))?;
+        let current_exe_str = current_exe.to_string_lossy();
+        let tr_value = format!("\"{}\" --host", current_exe_str);
+        
+        let output = std::process::Command::new("schtasks")
+            .args(&["/create", "/tn", "LanPilotAutoStart", "/tr", &tr_value, "/sc", "onlogon", "/rl", "highest", "/f"])
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
+            .output()
+            .map_err(|e| format!("Error al ejecutar schtasks: {e}"))?;
+            
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("Error de schtasks: {}", stderr.trim()));
+        }
+    } else {
+        let output = std::process::Command::new("schtasks")
+            .args(&["/delete", "/tn", "LanPilotAutoStart", "/f"])
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
+            .output()
+            .map_err(|e| format!("Error al ejecutar schtasks: {e}"))?;
+            
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("Error de schtasks: {}", stderr.trim()));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn set_autostart_task(_enable: bool) -> Result<(), String> {
+    Err("Solo soportado en Windows".to_string())
 }

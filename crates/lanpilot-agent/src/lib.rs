@@ -28,6 +28,7 @@ use lanpilot_core::{
     EdgeSwitchConfig, HandshakeAck, HandshakeHello, Logger, PRODUCT_NAME, PROTOCOL_MAGIC, StopFlag,
     SessionEvent, StreamCompression, StreamFrame, StreamHello, TAGLINE, from_json_line, is_stopped,
     log_session_event, normalize_pair_code, should_switch_to_remote, to_json_line, unix_timestamp_ms,
+    AUDIO_PORT,
 };
 use lz4_flex::decompress_size_prepended;
 use minifb::{Scale, Window, WindowOptions};
@@ -68,15 +69,103 @@ impl AgentConfig {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct RecentHost {
+    ip: String,
+    host_name: String,
+    last_connected: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+struct RecentHostsList {
+    hosts: Vec<RecentHost>,
+}
+
+fn load_recent_hosts() -> RecentHostsList {
+    let path = "C:\\Users\\carlo\\.gemini\\antigravity\\recent_hosts.json";
+    if let Ok(content) = std::fs::read_to_string(path) {
+        if let Ok(list) = serde_json::from_str::<RecentHostsList>(&content) {
+            return list;
+        }
+    }
+    RecentHostsList::default()
+}
+
+fn save_recent_hosts(list: &RecentHostsList) {
+    let path = "C:\\Users\\carlo\\.gemini\\antigravity\\recent_hosts.json";
+    let _ = std::fs::create_dir_all("C:\\Users\\carlo\\.gemini\\antigravity");
+    if let Ok(serialized) = serde_json::to_string_pretty(list) {
+        let _ = std::fs::write(path, serialized);
+    }
+}
+
 /// Run the LanPilot agent connection flow to completion (or until `stop` is
 /// set / an unrecoverable error occurs).
 ///
+#[cfg(windows)]
+fn make_process_dpi_aware() {
+    unsafe {
+        #[link(name = "shcore")]
+        unsafe extern "system" {
+            fn SetProcessDpiAwareness(value: i32) -> i32;
+        }
+        let _ = SetProcessDpiAwareness(2); // PROCESS_PER_MONITOR_DPI_AWARE
+
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn SetProcessDPIAware() -> i32;
+        }
+        let _ = SetProcessDPIAware();
+    }
+}
+
 /// This function blocks the calling thread; run it on a background thread
 /// (as `lanpilot-app` does) if the caller also needs to keep servicing a UI.
-pub fn run_agent(config: AgentConfig, logger: Logger, stop: StopFlag) -> Result<(), String> {
+pub fn run_agent(mut config: AgentConfig, logger: Logger, stop: StopFlag) -> Result<(), String> {
+    #[cfg(windows)]
+    make_process_dpi_aware();
     let agent_name = config.agent_name.clone().unwrap_or_else(|| "lanpilot-agent".to_string());
     let pair_code = normalize_pair_code(&config.pair_code)
         .ok_or_else(|| "el código de emparejamiento debe tener exactamente 6 dígitos".to_string())?;
+
+    if config.preferred_host_ipv4.is_none() {
+        let list = load_recent_hosts();
+        if !list.hosts.is_empty() {
+            println!("\n=== LanPilot Agent — Conexión Rápida ===");
+            println!("Selecciona una conexión reciente del historial o introduce una nueva IP:");
+            for (i, host) in list.hosts.iter().enumerate() {
+                println!("[{}] {} ({})", i + 1, host.ip, host.host_name);
+            }
+            println!("[0] Introducir nueva dirección IP manual");
+            print!("> ");
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            
+            let mut choice = String::new();
+            if std::io::stdin().read_line(&mut choice).is_ok() {
+                let trimmed = choice.trim();
+                if let Ok(num) = trimmed.parse::<usize>() {
+                    if num > 0 && num <= list.hosts.len() {
+                        let selected_ip = list.hosts[num - 1].ip.clone();
+                        let selected_name = list.hosts[num - 1].host_name.clone();
+                        logger.log(format!("Seleccionado del historial: {} ({})", selected_ip, selected_name));
+                        config.preferred_host_ipv4 = Some(selected_ip);
+                        config.preferred_host_name = Some(selected_name);
+                    }
+                } else if !trimmed.is_empty() && trimmed != "0" {
+                    config.preferred_host_ipv4 = Some(trimmed.to_string());
+                }
+            }
+        }
+    }
+
+    if let Some(ref ip_str) = config.preferred_host_ipv4 {
+        if let Ok(ip) = ip_str.parse::<std::net::IpAddr>() {
+            if !lanpilot_core::is_private_ip(ip) {
+                return Err(format!("Dirección IP destino no es una IP privada local válida: {}", ip_str));
+            }
+        }
+    }
 
     logger.log(format!("{PRODUCT_NAME} Agent"));
     logger.log(TAGLINE.to_string());
@@ -101,6 +190,14 @@ pub fn run_agent(config: AgentConfig, logger: Logger, stop: StopFlag) -> Result<
     for (index, discovered) in candidates.into_iter().enumerate() {
         if is_stopped(&stop) {
             return Err("cancelado por el usuario".to_string());
+        }
+        if let Ok(ip) = discovered.host_ipv4.parse::<std::net::IpAddr>() {
+            if !lanpilot_core::is_private_ip(ip) {
+                logger.log(format!("Ignorando candidato de IP pública no autorizada: {}", discovered.host_ipv4));
+                continue;
+            }
+        } else {
+            continue;
         }
         logger.log(format!(
             "Intentando equipo {}/{}: {} ({}:{})",
@@ -149,6 +246,20 @@ pub fn run_agent(config: AgentConfig, logger: Logger, stop: StopFlag) -> Result<
         ));
         logger.log(format!("✓ Conectado a {}. Sesión activa.", ack.host_name));
 
+        // Registrar host en el historial recent_hosts.json
+        {
+            let connected_ip = discovered.host_ipv4.clone();
+            let mut list = load_recent_hosts();
+            list.hosts.retain(|h| h.ip != connected_ip);
+            list.hosts.insert(0, RecentHost {
+                ip: connected_ip,
+                host_name: ack.host_name.clone(),
+                last_connected: unix_timestamp_ms() as u64,
+            });
+            list.hosts.truncate(5);
+            save_recent_hosts(&list);
+        }
+
         match run_phase2_with_retry(&discovered.host_ipv4, &ack, &logger, &stop) {
             Ok(()) => {}
             Err(err) if is_transient_message(&err) => {
@@ -193,19 +304,26 @@ fn resolve_host_candidates(
         discovery_started.elapsed().as_millis(),
         responses.len()
     ));
-    let ordered = order_host_candidates(responses, preferred_host_ipv4, preferred_host_name);
+    let mut ordered = order_host_candidates(responses, preferred_host_ipv4, preferred_host_name);
     if ordered.is_empty() {
-        if let Some(preferred_name) = preferred_host_name {
-            return Err(format!(
-                "No se encontró el equipo seleccionado ({preferred_name}) en la red local."
-            ));
-        }
         if let Some(preferred_ip) = preferred_host_ipv4 {
-            return Err(format!(
-                "No se encontró el equipo seleccionado ({preferred_ip}) en la red local."
+            logger.log(format!(
+                "Discovery UDP no encontró hosts. Creando candidato virtual para conexión directa: {preferred_ip}"
             ));
+            ordered.push(DiscoveryResponse {
+                magic: PROTOCOL_MAGIC.to_string(),
+                host_name: preferred_host_name.unwrap_or("preferred-host").to_string(),
+                host_ipv4: preferred_ip.to_string(),
+                handshake_port: lanpilot_core::HANDSHAKE_PORT,
+            });
+        } else {
+            if let Some(preferred_name) = preferred_host_name {
+                return Err(format!(
+                    "No se encontró el equipo seleccionado ({preferred_name}) en la red local."
+                ));
+            }
+            return Err("No se encontró ningún host LanPilot en la red local.".to_string());
         }
-        return Err("No se encontró ningún host LanPilot en la red local.".to_string());
     }
     Ok(ordered)
 }
@@ -286,63 +404,65 @@ fn discover_hosts_with_timeout(
     socket
         .set_broadcast(true)
         .map_err(|err| format!("set broadcast failed: {err}"))?;
-    let read_slice = std::cmp::min(timeout, Duration::from_millis(220));
     socket
-        .set_read_timeout(Some(read_slice))
+        .set_read_timeout(Some(Duration::from_millis(300)))
         .map_err(|err| format!("set read timeout failed: {err}"))?;
 
     let probe = DiscoveryProbe::new(agent_name.to_string(), pair_code.to_string());
     let payload = to_json_line(&probe).map_err(|err| format!("encode probe failed: {err}"))?;
-    let target = SocketAddr::from((Ipv4Addr::BROADCAST, DISCOVERY_PORT));
-    socket
-        .send_to(payload.as_bytes(), target)
-        .map_err(|err| format!("send discovery failed: {err}"))?;
-
-    let started = Instant::now();
-    let mut rebroadcasted = false;
-    let mut by_ip: HashMap<String, DiscoveryResponse> = HashMap::new();
-    let mut buf = [0_u8; 2048];
-
-    while started.elapsed() < timeout {
-        if !rebroadcasted && started.elapsed() >= timeout / 2 {
-            socket
-                .send_to(payload.as_bytes(), target)
-                .map_err(|err| format!("resend discovery failed: {err}"))?;
-            rebroadcasted = true;
-        }
-        match socket.recv_from(&mut buf) {
-            Ok((received, source)) => {
-                let response_line = std::str::from_utf8(&buf[..received])
-                    .map_err(|err| format!("utf8 discovery response failed: {err}"))?;
-                let response: DiscoveryResponse = from_json_line(response_line)
-                    .map_err(|err| format!("decode discovery response failed: {err}"))?;
-
-                if response.magic != PROTOCOL_MAGIC {
-                    continue;
-                }
-
-                // Reject forged responses: the IP in the payload must match the packet source.
-                let claimed_ip = response
-                    .host_ipv4
-                    .parse::<std::net::IpAddr>()
-                    .map_err(|err| format!("invalid host_ipv4 in discovery response: {err}"))?;
-                if source.ip() != claimed_ip {
-                    continue;
-                }
-
-                by_ip.entry(response.host_ipv4.clone()).or_insert(response);
-            }
-            Err(err)
-                if err.kind() == std::io::ErrorKind::TimedOut
-                    || err.kind() == std::io::ErrorKind::WouldBlock =>
-            {
-                continue;
-            }
-            Err(err) => return Err(format!("receive discovery response failed: {err}")),
-        }
+    
+    let mut targets = vec![SocketAddr::from((Ipv4Addr::BROADCAST, DISCOVERY_PORT))];
+    if let Some(local_ip) = lanpilot_core::local_ipv4() {
+        let octets = local_ip.octets();
+        let subnet_broadcast = Ipv4Addr::new(octets[0], octets[1], octets[2], 255);
+        targets.push(SocketAddr::from((subnet_broadcast, DISCOVERY_PORT)));
     }
 
-    let mut responses: Vec<DiscoveryResponse> = by_ip.into_values().collect();
+    let socket_clone = socket.try_clone().map_err(|err| format!("clone discovery socket failed: {err}"))?;
+    let by_ip = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let by_ip_clone = std::sync::Arc::clone(&by_ip);
+
+    let listener_handle = std::thread::spawn(move || {
+        let mut buf = [0_u8; 2048];
+        while let Ok((received, source)) = socket_clone.recv_from(&mut buf) {
+            if let Ok(response_line) = std::str::from_utf8(&buf[..received]) {
+                if let Ok(response) = from_json_line::<DiscoveryResponse>(response_line) {
+                    if response.magic == PROTOCOL_MAGIC {
+                        if let Ok(claimed_ip) = response.host_ipv4.parse::<std::net::IpAddr>() {
+                            if source.ip() == claimed_ip {
+                                if let Ok(mut guard) = by_ip_clone.lock() {
+                                    guard.insert(response.host_ipv4.clone(), response);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    let started = Instant::now();
+    let mut last_send = Instant::now() - Duration::from_secs(1);
+
+    while started.elapsed() < timeout {
+        if last_send.elapsed() >= Duration::from_millis(400) {
+            for target in &targets {
+                let _ = socket.send_to(payload.as_bytes(), *target);
+            }
+            last_send = Instant::now();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    drop(socket);
+    let _ = listener_handle.join();
+
+    let final_map = std::sync::Arc::try_unwrap(by_ip)
+        .map_err(|_| "failed to unwrap responses mutex".to_string())?
+        .into_inner()
+        .map_err(|_| "failed to get inner responses map".to_string())?;
+
+    let mut responses: Vec<DiscoveryResponse> = final_map.into_values().collect();
     responses.sort_by(|a, b| a.host_name.cmp(&b.host_name).then(a.host_ipv4.cmp(&b.host_ipv4)));
     if responses.is_empty() {
         return Err(
@@ -529,6 +649,7 @@ fn run_phase2_input_channel(host_ipv4: &str, ack: &HandshakeAck, logger: &Logger
     let endpoint = format!("{}:{}", host_ipv4, ack.control_port);
     let mut stream = TcpStream::connect(endpoint.as_str())
         .map_err(|err| format!("connect control socket failed: {err}"))?;
+    let _ = stream.set_nodelay(true);
     let encoded =
         to_json_line(&frame).map_err(|err| format!("encode control frame failed: {err}"))?;
     stream
@@ -594,6 +715,15 @@ fn run_phase2_with_retry(
     }
 }
 
+struct RenderJob {
+    buffer: Vec<u32>,
+    width: usize,
+    height: usize,
+    title: String,
+    compat_mode: bool,
+}
+
+#[allow(unused_assignments)]
 fn run_phase3_stream_channel(
     host_ipv4: &str,
     agent_name: &str,
@@ -606,6 +736,7 @@ fn run_phase3_stream_channel(
     let endpoint = format!("{}:{}", host_ipv4, ack.stream_port);
     let mut stream = TcpStream::connect(endpoint.as_str())
         .map_err(|err| format!("connect stream socket failed: {err}"))?;
+    let _ = stream.set_nodelay(true);
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .map_err(|err| format!("set stream read timeout failed: {err}"))?;
@@ -619,17 +750,18 @@ fn run_phase3_stream_channel(
 
     let mut reader = BufReader::new(stream);
     let render_enabled = config.render_enabled;
-    let mut renderer: Option<FrameRenderer> = None;
     let mut metrics = StreamMetrics::new();
     let target_frames = config.target_stream_frames;
 
-    // Open persistent control connection once for the session lifetime.
     let control_endpoint = format!("{}:{}", host_ipv4, ack.control_port);
     let mut control_stream = TcpStream::connect(control_endpoint.as_str())
         .map_err(|err| format!("connect persistent control socket failed: {err}"))?;
+    let _ = control_stream.set_nodelay(true);
     control_stream
         .set_write_timeout(Some(Duration::from_secs(5)))
         .map_err(|err| format!("set control write timeout failed: {err}"))?;
+
+    spawn_audio_client(host_ipv4.to_string(), stop.clone(), logger.clone());
 
     let mut received = 0_u32;
     let mut black_filtered = 0_u32;
@@ -638,13 +770,405 @@ fn run_phase3_stream_channel(
     let mut total_raw = 0_usize;
     let mut last_feedback: Option<(u32, u8)> = None;
     let mut black_filter_logged = false;
-    let mut last_compat_mode: Option<bool> = None;
+    let mut _last_compat_mode: Option<bool> = None;
+    #[allow(unused_assignments)]
+    let mut last_captured_at_ms = 0_u64;
+    let mut use_rgb565 = false;
+    let mut last_clipboard_image_hash: Option<u64> = None;
+    let mut last_clipboard_image_check = std::time::Instant::now();
+    let mut privacy_mode_active = false;
+    let mut last_frame_received_at = std::time::Instant::now();
+    let mut local_clipboard = arboard::Clipboard::new().ok();
+    let mut last_sent_clipboard = String::new();
+
+    let (render_tx, render_rx) = std::sync::mpsc::sync_channel::<RenderJob>(2);
+    let (buffer_pool_tx, buffer_pool_rx) = std::sync::mpsc::channel::<Vec<u32>>();
+    let (input_tx, input_rx) = std::sync::mpsc::channel::<ControlEvent>();
+
+    let _ = buffer_pool_tx.send(vec![0; 1920 * 1080]);
+    let _ = buffer_pool_tx.send(vec![0; 1920 * 1080]);
+
+    let stop_render = stop.clone();
+    let logger_render = logger.clone();
+    
+    let _render_thread = std::thread::spawn(move || {
+        let mut renderer: Option<FrameRenderer> = None;
+        let mut last_mouse_pos: Option<(f32, f32)> = None;
+        let mut last_left_down = false;
+        let mut last_right_down = false;
+        let mut last_middle_down = false;
+        let mut last_keys = std::collections::HashSet::<minifb::Key>::new();
+        let mut relative_mouse_mode = false;
+        let mut last_lock_state_check = std::time::Instant::now();
+        let mut last_caps_lock = None;
+        let mut last_num_lock = None;
+
+        let char_buffer_local = std::sync::Arc::new(std::sync::Mutex::new(Vec::<char>::new()));
+        let char_buffer_window = std::sync::Arc::clone(&char_buffer_local);
+
+        let mut frame_queue = std::collections::VecDeque::new();
+        let mut last_scheduled_draw = std::time::Instant::now();
+
+        while !is_stopped(&stop_render) {
+            let tick_start = std::time::Instant::now();
+
+            while let Ok(job) = render_rx.try_recv() {
+                let interval = std::time::Duration::from_millis(16);
+                let target_time = last_scheduled_draw.max(std::time::Instant::now()) + interval;
+                last_scheduled_draw = target_time;
+                frame_queue.push_back((target_time, job));
+            }
+
+            let now = std::time::Instant::now();
+            let mut drew_frame = false;
+            
+            if let Some(&(target_time, _)) = frame_queue.front() {
+                if now >= target_time {
+                    if let Some((_, job)) = frame_queue.pop_front() {
+                        if renderer.is_none() {
+                            if let Ok(mut r) = FrameRenderer::try_new(job.width, job.height) {
+                                r.char_buffer = std::sync::Arc::clone(&char_buffer_window);
+                                renderer = Some(r);
+                            }
+                        }
+                        if let Some(ref mut r) = renderer {
+                            if r.width != job.width || r.height != job.height {
+                                r.width = job.width;
+                                r.height = job.height;
+                                r.buffer.resize(job.width * job.height, 0);
+                            }
+                            r.buffer.copy_from_slice(&job.buffer);
+                            r.last_compat_mode = Some(job.compat_mode);
+                            r.window.set_title(&job.title);
+                            let _ = r.window.update_with_buffer(&r.buffer, job.width, job.height);
+                            let _ = buffer_pool_tx.send(job.buffer);
+                            drew_frame = true;
+                        }
+                    }
+                }
+            }
+
+            if !drew_frame {
+                if let Some(ref mut r) = renderer {
+                    let _ = r.window.update();
+                }
+            }
+
+            if let Some(ref mut r) = renderer {
+                if !r.window.is_open() {
+                    break;
+                }
+
+                let ctrl = r.window.is_key_down(minifb::Key::LeftCtrl) || r.window.is_key_down(minifb::Key::RightCtrl);
+                let alt = r.window.is_key_down(minifb::Key::LeftAlt) || r.window.is_key_down(minifb::Key::RightAlt);
+                let enter = r.window.is_key_pressed(minifb::Key::Enter, minifb::KeyRepeat::No);
+
+                if ctrl && alt && enter {
+                    let _ = r.toggle_fullscreen();
+                }
+                if ctrl && alt && r.window.is_key_down(minifb::Key::Q) {
+                    logger_render.log("Desconexión de pánico iniciada por el usuario (Ctrl + Alt + Q).".to_string());
+                    break;
+                }
+                if ctrl && alt && r.window.is_key_pressed(minifb::Key::M, minifb::KeyRepeat::No) {
+                    logger_render.log("Solicitando rotar de monitor capturado (Ctrl + Alt + M).".to_string());
+                    let _ = input_tx.send(ControlEvent::CycleMonitor);
+                }
+                if ctrl && alt && r.window.is_key_pressed(minifb::Key::L, minifb::KeyRepeat::No) {
+                    relative_mouse_mode = !relative_mouse_mode;
+                    r.window.set_cursor_visibility(!relative_mouse_mode);
+                    logger_render.log(format!("Modo ratón relativo alternado (Pointer Lock): {}", relative_mouse_mode));
+                }
+                if ctrl && alt && r.window.is_key_pressed(minifb::Key::P, minifb::KeyRepeat::No) {
+                    let _ = input_tx.send(ControlEvent::TogglePrivacyMode { enabled: true });
+                }
+                if ctrl && alt && r.window.is_key_pressed(minifb::Key::K, minifb::KeyRepeat::No) {
+                    let _ = input_tx.send(ControlEvent::SetVideoFormat { use_rgb565: true });
+                }
+                if ctrl && alt && r.window.is_key_pressed(minifb::Key::F, minifb::KeyRepeat::No) {
+                    let _ = input_tx.send(ControlEvent::FileChunk { filename: "trigger_select_file".to_string(), offset: 0, total_size: 0, data_b64: String::new() });
+                }
+
+                #[cfg(windows)]
+                {
+                    if last_lock_state_check.elapsed() >= std::time::Duration::from_millis(500) {
+                        last_lock_state_check = std::time::Instant::now();
+                        unsafe {
+                            let caps = (GetKeyState(0x14) & 1) != 0;
+                            let num = (GetKeyState(0x90) & 1) != 0;
+                            if last_caps_lock != Some(caps) || last_num_lock != Some(num) {
+                                let _ = input_tx.send(ControlEvent::KeyLockState { caps_lock: caps, num_lock: num });
+                                last_caps_lock = Some(caps);
+                                last_num_lock = Some(num);
+                            }
+                        }
+                    }
+                }
+
+                if relative_mouse_mode {
+                    let (win_w, win_h) = r.window.get_size();
+                    let center_x = win_w as f32 / 2.0;
+                    let center_y = win_h as f32 / 2.0;
+                    if let Some((mx, my)) = r.window.get_mouse_pos(minifb::MouseMode::Pass) {
+                        let dx = (mx - center_x) as i32;
+                        let dy = (my - center_y) as i32;
+                        if dx != 0 || dy != 0 {
+                            let _ = input_tx.send(ControlEvent::MouseMoveRelative { dx, dy });
+                            let (win_left, win_top) = r.window.get_position();
+                            let screen_center_x = win_left as i32 + (win_w as i32 / 2);
+                            let screen_center_y = win_top as i32 + (win_h as i32 / 2);
+                            #[cfg(windows)]
+                            unsafe {
+                                let _ = SetCursorPos(screen_center_x, screen_center_y);
+                            }
+                        }
+                    }
+                } else {
+                    if let Some((mx, my)) = r.window.get_mouse_pos(minifb::MouseMode::Discard) {
+                        let current_pos = (mx, my);
+                        if last_mouse_pos != Some(current_pos) {
+                            let _ = input_tx.send(ControlEvent::MouseMove { dx: mx as i32, dy: my as i32 });
+                            last_mouse_pos = Some(current_pos);
+                        }
+                    }
+                }
+
+                let left_down = r.window.get_mouse_down(minifb::MouseButton::Left);
+                if left_down != last_left_down {
+                    let _ = input_tx.send(ControlEvent::MouseButton { button: "left".to_string(), pressed: left_down });
+                    last_left_down = left_down;
+                }
+                let right_down = r.window.get_mouse_down(minifb::MouseButton::Right);
+                if right_down != last_right_down {
+                    let _ = input_tx.send(ControlEvent::MouseButton { button: "right".to_string(), pressed: right_down });
+                    last_right_down = right_down;
+                }
+                let middle_down = r.window.get_mouse_down(minifb::MouseButton::Middle);
+                if middle_down != last_middle_down {
+                    let _ = input_tx.send(ControlEvent::MouseButton { button: "middle".to_string(), pressed: middle_down });
+                    last_middle_down = middle_down;
+                }
+
+                let current_keys = r.window.get_keys();
+                let current_keys_set: std::collections::HashSet<minifb::Key> = current_keys.iter().cloned().collect();
+                for k in &current_keys_set {
+                    if !last_keys.contains(k) {
+                        let _ = input_tx.send(ControlEvent::Key { key: format!("{:?}", k), pressed: true });
+                    }
+                }
+                for k in &last_keys {
+                    if !current_keys_set.contains(k) {
+                        let _ = input_tx.send(ControlEvent::Key { key: format!("{:?}", k), pressed: false });
+                    }
+                }
+                last_keys = current_keys_set;
+
+                let mut char_keys = Vec::new();
+                if let Ok(mut guard) = r.char_buffer.lock() {
+                    char_keys = std::mem::take(&mut *guard);
+                }
+                for c in char_keys {
+                    if !c.is_control() {
+                        let _ = input_tx.send(ControlEvent::UnicodeChar { ch: c.to_string() });
+                    }
+                }
+            }
+
+            let elapsed = tick_start.elapsed();
+            if elapsed < std::time::Duration::from_millis(8) {
+                std::thread::sleep(std::time::Duration::from_millis(8) - elapsed);
+            }
+        }
+    });
+
+    let render_tx_clone = render_tx.clone();
+    let handle_disconnect = |logger: &Logger, render_tx: &std::sync::mpsc::SyncSender<RenderJob>| -> Result<(TcpStream, TcpStream, BufReader<TcpStream>), String> {
+        let dummy_job = RenderJob {
+            buffer: vec![0; 320 * 240],
+            width: 320,
+            height: 240,
+            title: "[RECONECTANDO...] LanPilot Agent Stream".to_string(),
+            compat_mode: true,
+        };
+        let _ = render_tx.send(dummy_job);
+        logger.log("Conexión perdida. Iniciando reconexión adaptativa automática de 15 segundos...".to_string());
+        let start_reconnect = std::time::Instant::now();
+        loop {
+            if is_stopped(stop) {
+                return Err("Reconexión cancelada por el usuario.".to_string());
+            }
+            if start_reconnect.elapsed() >= std::time::Duration::from_secs(15) {
+                return Err("Tiempo de reconexión agotado (15 segundos).".to_string());
+            }
+            
+            let stream_endpoint = format!("{}:{}", host_ipv4, ack.stream_port);
+            let control_endpoint = format!("{}:{}", host_ipv4, ack.control_port);
+            
+            if let Ok(new_stream) = TcpStream::connect(stream_endpoint.as_str()) {
+                if let Ok(new_control) = TcpStream::connect(control_endpoint.as_str()) {
+                    let _ = new_stream.set_nodelay(true);
+                    let _ = new_stream.set_read_timeout(Some(Duration::from_secs(2)));
+                    
+                    let _ = new_control.set_nodelay(true);
+                    let _ = new_control.set_write_timeout(Some(Duration::from_secs(5)));
+                    
+                    let hello = StreamHello::new(ack.session_id.clone(), agent_name.to_string());
+                    if let Ok(hello_line) = to_json_line(&hello) {
+                        let mut temp_stream = new_stream;
+                        if temp_stream.write_all(hello_line.as_bytes()).is_ok() {
+                            logger.log("Conexión restablecida con éxito de forma transparente.".to_string());
+                            let new_reader = BufReader::new(temp_stream.try_clone().unwrap());
+                            return Ok((temp_stream, new_control, new_reader));
+                        }
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+        }
+    };
 
     while target_frames == 0 || received < target_frames {
         if is_stopped(stop) {
             logger.log("Transmisión cancelada por el usuario.".to_string());
             break;
         }
+
+        while let Ok(event) = input_rx.try_recv() {
+            match event {
+                ControlEvent::TogglePrivacyMode { .. } => {
+                    privacy_mode_active = !privacy_mode_active;
+                    logger.log(format!("Solicitando alternar Modo Privacidad en Host (Activo={}).", privacy_mode_active));
+                    let ev = ControlEvent::TogglePrivacyMode { enabled: privacy_mode_active };
+                    let control_frame = ControlFrame::new(ack.session_id.clone(), vec![ev]);
+                    if let Ok(line) = to_json_line(&control_frame) {
+                        let _ = control_stream.write_all(line.as_bytes());
+                    }
+                }
+                ControlEvent::SetVideoFormat { .. } => {
+                    use_rgb565 = !use_rgb565;
+                    logger.log(format!("Solicitando cambio de formato de video (use_rgb565={}).", use_rgb565));
+                    let ev = ControlEvent::SetVideoFormat { use_rgb565 };
+                    let control_frame = ControlFrame::new(ack.session_id.clone(), vec![ev]);
+                    if let Ok(line) = to_json_line(&control_frame) {
+                        let _ = control_stream.write_all(line.as_bytes());
+                    }
+                }
+                ControlEvent::FileChunk { filename, .. } if filename == "trigger_select_file" => {
+                    logger.log("Abriendo selector de archivos para transferencia remota (Ctrl + Alt + F)...".to_string());
+                    let control_stream_clone = control_stream.try_clone().ok();
+                    let session_id = ack.session_id.clone();
+                    let logger_thread = logger.clone();
+                    std::thread::spawn(move || {
+                        let Some(mut stream) = control_stream_clone else { return; };
+                        let mut reader_stream = match stream.try_clone() {
+                            Ok(s) => std::io::BufReader::new(s),
+                            Err(_) => return,
+                        };
+                        
+                        let script = "[System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms') | Out-Null; \
+                                      $o = New-Object System.Windows.Forms.OpenFileDialog; \
+                                      $o.Filter = 'Todos los archivos (*.*)|*.*'; \
+                                      $o.Title = 'Selecciona archivo para enviar al Host'; \
+                                      if($o.ShowDialog() -eq 'OK') { $o.FileName }";
+                        let output = std::process::Command::new("powershell")
+                            .args(&["-NoProfile", "-Command", script])
+                            .output();
+                        if let Ok(res) = output {
+                            let path_str = String::from_utf8_lossy(&res.stdout).trim().to_string();
+                            if path_str.is_empty() { return; }
+                            let path = std::path::Path::new(&path_str);
+                            if !path.exists() { return; }
+                            let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("archivo").to_string();
+                            let total_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                            logger_thread.log(format!("Iniciando transferencia asíncrona de '{}' ({} bytes)", filename, total_size));
+                            if let Ok(mut file) = std::fs::File::open(&path) {
+                                use std::io::Read;
+                                use std::io::Write;
+                                use std::io::BufRead;
+                                use std::io::Seek;
+                                
+                                let mut buffer = vec![0u8; 131072];
+                                let mut offset = 0_u64;
+                                let mut acked_offset = 0_u64;
+                                let mut in_flight = std::collections::VecDeque::new();
+                                const WINDOW_SIZE: usize = 6;
+                                
+                                let _ = reader_stream.get_ref().set_read_timeout(Some(std::time::Duration::from_secs(2)));
+
+                                loop {
+                                    while in_flight.len() < WINDOW_SIZE {
+                                        match file.read(&mut buffer) {
+                                            Ok(0) => break,
+                                            Ok(n) => {
+                                                let chunk_b64 = BASE64.encode(&buffer[0..n]);
+                                                let event = ControlEvent::FileChunk {
+                                                    filename: filename.clone(),
+                                                    offset,
+                                                    total_size,
+                                                    data_b64: chunk_b64,
+                                                };
+                                                let control_frame = ControlFrame::new(session_id.clone(), vec![event]);
+                                                if let Ok(line) = to_json_line(&control_frame) {
+                                                    let _ = stream.write_all(line.as_bytes());
+                                                }
+                                                in_flight.push_back((offset, n as u64));
+                                                offset += n as u64;
+                                            }
+                                            Err(_) => return,
+                                        }
+                                    }
+
+                                    if in_flight.is_empty() {
+                                        break;
+                                    }
+
+                                    let mut ack_line = String::new();
+                                    match reader_stream.read_line(&mut ack_line) {
+                                        Ok(0) => {
+                                            logger_thread.log("Conexión de transferencia cerrada.".to_string());
+                                            return;
+                                        }
+                                        Ok(_) => {
+                                            if let Ok(frame) = from_json_line::<ControlFrame>(&ack_line) {
+                                                for ev in frame.events {
+                                                    if let ControlEvent::FileChunkAck { offset: ack_offset, .. } = ev {
+                                                        while let Some(&(off, size)) = in_flight.front() {
+                                                            if off <= ack_offset {
+                                                                acked_offset = off + size;
+                                                                in_flight.pop_front();
+                                                            } else {
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut || e.kind() == std::io::ErrorKind::WouldBlock => {
+                                            if let Some(&(first_off, _)) = in_flight.front() {
+                                                logger_thread.log(format!("Re-sincronizando ventana de transferencia desde offset {}...", first_off));
+                                            }
+                                            in_flight.clear();
+                                            offset = acked_offset;
+                                            let _ = file.seek(std::io::SeekFrom::Start(offset));
+                                        }
+                                        Err(_) => return,
+                                    }
+                                }
+                                logger_thread.log(format!("Transferencia asíncrona de '{}' finalizada con éxito.", filename));
+                            }
+                        }
+                    });
+                }
+                other_event => {
+                    let control_frame = ControlFrame::new(ack.session_id.clone(), vec![other_event]);
+                    if let Ok(line) = to_json_line(&control_frame) {
+                        let _ = control_stream.write_all(line.as_bytes());
+                    }
+                }
+            }
+        }
+
         let mut line = String::new();
         let bytes_read = match reader.read_line(&mut line) {
             Ok(n) => n,
@@ -652,33 +1176,133 @@ fn run_phase3_stream_channel(
                 if err.kind() == std::io::ErrorKind::TimedOut
                     || err.kind() == std::io::ErrorKind::WouldBlock =>
             {
+                if last_frame_received_at.elapsed() >= std::time::Duration::from_secs(6) {
+                    logger.log("Keep-alive timeout expirado. Intentando reconectar...".to_string());
+                    match handle_disconnect(&logger, &render_tx_clone) {
+                        Ok((new_s, new_c, new_r)) => {
+                            stream = new_s;
+                            control_stream = new_c;
+                            reader = new_r;
+                            last_frame_received_at = std::time::Instant::now();
+                            timeout_streak = 0;
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
                 timeout_streak += 1;
                 if timeout_streak >= MAX_CONSECUTIVE_STREAM_TIMEOUTS {
-                    return Err("stream timeout waiting for frames".to_string());
+                    logger.log("Múltiples timeouts consecutivos. Intentando reconectar...".to_string());
+                    match handle_disconnect(&logger, &render_tx_clone) {
+                        Ok((new_s, new_c, new_r)) => {
+                            stream = new_s;
+                            control_stream = new_c;
+                            reader = new_r;
+                            last_frame_received_at = std::time::Instant::now();
+                            timeout_streak = 0;
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
                 continue;
             }
-            Err(err) => return Err(format!("read stream frame failed: {err}")),
+            Err(err) => {
+                logger.log(format!("Error de lectura en socket: {err}. Intentando reconectar..."));
+                match handle_disconnect(&logger, &render_tx_clone) {
+                    Ok((new_s, new_c, new_r)) => {
+                        stream = new_s;
+                        control_stream = new_c;
+                        reader = new_r;
+                        last_frame_received_at = std::time::Instant::now();
+                        timeout_streak = 0;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
         };
         if bytes_read == 0 {
-            break;
+            logger.log("Socket de red cerrado de golpe. Intentando reconectar...".to_string());
+            match handle_disconnect(&logger, &render_tx_clone) {
+                Ok((new_s, new_c, new_r)) => {
+                    stream = new_s;
+                    control_stream = new_c;
+                    reader = new_r;
+                    last_frame_received_at = std::time::Instant::now();
+                    timeout_streak = 0;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
         }
+        last_frame_received_at = std::time::Instant::now();
         timeout_streak = 0;
+
         let frame: StreamFrame =
             from_json_line(&line).map_err(|err| format!("decode stream frame failed: {err}"))?;
         if frame.magic != PROTOCOL_MAGIC || frame.session_id != ack.session_id {
             return Err(format!("invalid stream frame payload: {:?}", frame));
         }
-        let compat_mode = frame.source.eq_ignore_ascii_case("synthetic");
-        if last_compat_mode != Some(compat_mode) {
-            logger.log(if compat_mode {
-                "Modo compatibilidad activo (sin captura real).".to_string()
-            } else {
-                "Captura real del equipo remoto activa.".to_string()
-            });
-            last_compat_mode = Some(compat_mode);
+
+        if frame.source == "clipboard" {
+            if let Ok(compressed) = BASE64.decode(&frame.compressed_payload_b64) {
+                if let Ok(decompressed) = lz4_flex::decompress_size_prepended(&compressed) {
+                    if let Ok(text) = String::from_utf8(decompressed) {
+                        let text_trimmed = text.trim().to_string();
+                        if !text_trimmed.is_empty() {
+                            if let Some(ref mut cb) = local_clipboard {
+                                let _ = cb.set_text(text_trimmed.clone());
+                                last_sent_clipboard = text_trimmed;
+                                logger.log(format!("Portapapeles sincronizado desde host remoto: {} bytes", last_sent_clipboard.len()));
+                            }
+                        }
+                    }
+                }
+            }
+            continue;
         }
 
+        if frame.source == "ping" {
+            let response = ControlEvent::Pong { timestamp_ms: frame.captured_at_ms as u64 };
+            let control_frame = ControlFrame::new(ack.session_id.clone(), vec![response]);
+            if let Ok(line) = to_json_line(&control_frame) {
+                let _ = control_stream.write_all(line.as_bytes());
+            }
+            continue;
+        }
+
+        if frame.source == "clipboard_image" {
+            if let Ok(compressed) = BASE64.decode(&frame.compressed_payload_b64) {
+                if let Ok(decompressed) = lz4_flex::decompress_size_prepended(&compressed) {
+                    if let Some(ref mut cb) = local_clipboard {
+                        let img_data = arboard::ImageData {
+                            width: frame.width as usize,
+                            height: frame.height as usize,
+                            bytes: std::borrow::Cow::Owned(decompressed),
+                        };
+                        let hash = {
+                            let mut h = img_data.width as u64 ^ img_data.height as u64;
+                            let len = img_data.bytes.len();
+                            if len > 0 {
+                                h = h.wrapping_add(len as u64);
+                                h = h.wrapping_add(img_data.bytes[0] as u64);
+                                h = h.wrapping_add(img_data.bytes[len / 2] as u64);
+                                h = h.wrapping_add(img_data.bytes[len - 1] as u64);
+                            }
+                            h
+                        };
+                        last_clipboard_image_hash = Some(hash);
+                        let _ = cb.set_image(img_data);
+                        logger.log(format!("Portapapeles de imagen sincronizado desde host remoto: {}x{}", frame.width, frame.height));
+                    }
+                }
+            }
+            continue;
+        }
+
+        last_captured_at_ms = frame.captured_at_ms as u64;
+        let compat_mode = frame.source.eq_ignore_ascii_case("synthetic");
         let raw = decode_stream_frame(&frame)?;
         if is_mostly_black_frame(&raw, frame.stride_bytes, frame.width as usize, frame.height as usize) {
             black_filtered += 1;
@@ -688,16 +1312,123 @@ fn run_phase3_stream_channel(
             }
             continue;
         }
+
         if render_enabled {
-            if renderer.is_none() {
-                renderer = Some(FrameRenderer::try_new()?);
+            let width = frame.width as usize;
+            let height = frame.height as usize;
+            let stride_bytes = frame.stride_bytes;
+            let is_rgb565 = frame.pixel_format == "rgb565";
+
+            let mut draw_buf = match buffer_pool_rx.try_recv() {
+                Ok(buf) => buf,
+                Err(_) => vec![0; width * height],
+            };
+            if draw_buf.len() != width * height {
+                draw_buf.resize(width * height, 0);
             }
-            if let Some(renderer) = renderer.as_mut() {
-                renderer.render(&frame, &raw, compat_mode)?;
-                if !renderer.is_open() {
-                    break;
+
+            if let Some(ref tiles) = frame.tiles {
+                for tile in tiles {
+                    if let Ok(compressed) = BASE64.decode(tile.compressed_payload_b64.as_bytes()) {
+                        if let Ok(decompressed) = decompress_size_prepended(&compressed) {
+                            let tile_row_stride = tile.width as usize * (if is_rgb565 { 2 } else { 4 });
+                            for ty in 0..tile.height as usize {
+                                let gy = tile.y as usize + ty;
+                                if gy >= height { continue; }
+                                for tx in 0..tile.width as usize {
+                                    let gx = tile.x as usize + tx;
+                                    if gx >= width { continue; }
+                                    
+                                    if is_rgb565 {
+                                        let idx = ty * tile_row_stride + tx * 2;
+                                        if idx + 1 < decompressed.len() {
+                                            let val = (decompressed[idx] as u16) | ((decompressed[idx + 1] as u16) << 8);
+                                            let r5 = (val >> 11) & 0x1F;
+                                            let g6 = (val >> 5) & 0x3F;
+                                            let b5 = val & 0x1F;
+                                            let r = ((r5 * 255) / 31) as u32;
+                                            let g = ((g6 * 255) / 63) as u32;
+                                            let b = ((b5 * 255) / 31) as u32;
+                                            draw_buf[gy * width + gx] = (r << 16) | (g << 8) | b;
+                                        }
+                                    } else {
+                                        let idx = ty * tile_row_stride + tx * 4;
+                                        if idx + 2 < decompressed.len() {
+                                            let b = decompressed[idx] as u32;
+                                            let g = decompressed[idx + 1] as u32;
+                                            let r = decompressed[idx + 2] as u32;
+                                            draw_buf[gy * width + gx] = (r << 16) | (g << 8) | b;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                if is_rgb565 {
+                    for y in 0..height {
+                        let row_start = y * stride_bytes;
+                        for x in 0..width {
+                            let idx = row_start + x * 2;
+                            if idx + 1 < raw.len() {
+                                let val = (raw[idx] as u16) | ((raw[idx + 1] as u16) << 8);
+                                let r5 = (val >> 11) & 0x1F;
+                                let g6 = (val >> 5) & 0x3F;
+                                let b5 = val & 0x1F;
+                                let r = ((r5 * 255) / 31) as u32;
+                                let g = ((g6 * 255) / 63) as u32;
+                                let b = ((b5 * 255) / 31) as u32;
+                                draw_buf[y * width + x] = (r << 16) | (g << 8) | b;
+                            }
+                        }
+                    }
+                } else {
+                    if stride_bytes == width * 4 && raw.len() >= width * height * 4 {
+                        unsafe {
+                            let src_u32 = std::slice::from_raw_parts(raw.as_ptr() as *const u32, width * height);
+                            draw_buf.copy_from_slice(src_u32);
+                        }
+                    } else {
+                        for y in 0..height {
+                            let row_start = y * stride_bytes;
+                            for x in 0..width {
+                                let idx = row_start + x * 4;
+                                if idx + 2 < raw.len() {
+                                    let b = raw[idx] as u32;
+                                    let g = raw[idx + 1] as u32;
+                                    let r = raw[idx + 2] as u32;
+                                    draw_buf[y * width + x] = (r << 16) | (g << 8) | b;
+                                }
+                            }
+                        }
+                    }
                 }
             }
+
+            let summary = metrics.summary();
+            let quality = if summary.avg_latency_ms < 20.0 {
+                "[Excelente 🟢]"
+            } else if summary.avg_latency_ms <= 60.0 {
+                "[Buena 🟡]"
+            } else {
+                "[Alerta de Red 🔴]"
+            };
+            let privacy_suffix = if privacy_mode_active { " [PRIVADO 🕶️]" } else { "" };
+            let title = if compat_mode {
+                format!("LanPilot Agent Stream — {} — Modo compatibilidad ({:.1} FPS — Latencia: {:.0}ms){}", quality, summary.fps, summary.avg_latency_ms, privacy_suffix)
+            } else {
+                format!("LanPilot Agent Stream — {} — {:.1} FPS — Latencia: {:.0}ms{}", quality, summary.fps, summary.avg_latency_ms, privacy_suffix)
+            };
+
+            let job = RenderJob {
+                buffer: draw_buf,
+                width,
+                height,
+                title,
+                compat_mode,
+            };
+            let _ = render_tx.send(job);
         }
 
         received += 1;
@@ -708,31 +1439,70 @@ fn run_phase3_stream_channel(
         if received % 10 == 0 {
             let summary = metrics.summary();
             let (target_fps, scale_divisor) = choose_adaptive_target(&summary);
-            let next_feedback = (target_fps, scale_divisor);
-            if last_feedback != Some(next_feedback) {
-                send_stream_feedback(&mut control_stream, ack, &summary, target_fps, scale_divisor)?;
-                last_feedback = Some(next_feedback);
+            let echo = last_captured_at_ms;
+            if last_feedback != Some((target_fps, scale_divisor)) {
+                last_feedback = Some((target_fps, scale_divisor));
+                let _ = send_stream_feedback(
+                    &mut control_stream,
+                    ack,
+                    &summary,
+                    target_fps,
+                    scale_divisor,
+                    echo,
+                );
+            }
+
+            if let Some(ref mut cb) = local_clipboard {
+                if let Ok(text) = cb.get_text() {
+                    let text_trimmed = text.trim().to_string();
+                    if !text_trimmed.is_empty() && text_trimmed != last_sent_clipboard {
+                        let clipboard_frame = ControlFrame::new(
+                            ack.session_id.clone(),
+                            vec![ControlEvent::Clipboard { text: text_trimmed.clone() }],
+                        );
+                        if let Ok(line) = to_json_line(&clipboard_frame) {
+                            let _ = control_stream.write_all(line.as_bytes());
+                            last_sent_clipboard = text_trimmed;
+                        }
+                    }
+                }
+                
+                let now_time = std::time::Instant::now();
+                if now_time.duration_since(last_clipboard_image_check) >= std::time::Duration::from_millis(1500) {
+                    last_clipboard_image_check = now_time;
+                    if let Ok(img) = cb.get_image() {
+                        let hash = {
+                            let mut h = img.width as u64 ^ img.height as u64;
+                            let len = img.bytes.len();
+                            if len > 0 {
+                                h = h.wrapping_add(len as u64);
+                                h = h.wrapping_add(img.bytes[0] as u64);
+                                h = h.wrapping_add(img.bytes[len / 2] as u64);
+                                h = h.wrapping_add(img.bytes[len - 1] as u64);
+                            }
+                            h
+                        };
+                        if last_clipboard_image_hash != Some(hash) {
+                            last_clipboard_image_hash = Some(hash);
+                            let encoded = BASE64.encode(&img.bytes);
+                            let clipboard_img_frame = ControlFrame::new(
+                                ack.session_id.clone(),
+                                vec![ControlEvent::ClipboardImage {
+                                    width: img.width,
+                                    height: img.height,
+                                    rgba_payload_b64: encoded,
+                                }],
+                            );
+                            if let Ok(line) = to_json_line(&clipboard_img_frame) {
+                                  let _ = control_stream.write_all(line.as_bytes());
+                            }
+                        }
+                    }
+                }
             }
         }
     }
 
-    let summary = metrics.summary();
-    logger.log(format!(
-        "Phase 5: stream/render active, frames={} black_filtered={} last_seq={} raw={} fps={:.2} avg_latency_ms={:.2} jitter_ms={:.2}",
-        received, black_filtered, last_sequence, total_raw, summary.fps, summary.avg_latency_ms, summary.jitter_ms
-    ));
-    if received == 0 {
-        if black_filtered > 0 {
-            return Err(
-                "Conectado, pero el equipo remoto solo está enviando pantallas negras. Revisa permisos de captura de pantalla en el host (RDP/minimizado/bloqueo)."
-                    .to_string(),
-            );
-        }
-        return Err(
-            "No se recibieron frames del equipo remoto. Revisa que el host tenga permisos de captura de pantalla y que no haya bloqueo de red/firewall."
-                .to_string(),
-        );
-    }
     Ok(())
 }
 
@@ -826,14 +1596,12 @@ fn is_transient_message(message: &str) -> bool {
 }
 
 fn choose_adaptive_target(summary: &StreamSummary) -> (u32, u8) {
-    if summary.avg_latency_ms > 240.0 || summary.jitter_ms > 150.0 {
-        (5, 3)
-    } else if summary.avg_latency_ms > 170.0 || summary.jitter_ms > 100.0 {
-        (7, 2)
-    } else if summary.avg_latency_ms > 120.0 || summary.jitter_ms > 70.0 {
-        (9, 2)
+    if summary.avg_latency_ms > 200.0 || summary.jitter_ms > 100.0 {
+        (15, 3) // Conexión muy lenta / VPN: 15 FPS, escala 1/3 (ancho de banda ultra bajo)
+    } else if summary.avg_latency_ms > 80.0 || summary.jitter_ms > 40.0 {
+        (24, 2) // Conexión media / Wi-Fi inestable: 24 FPS, escala 1/2 (balanceado)
     } else {
-        (12, 1)
+        (60, 1) // Conexión óptima / LAN cableada: 60 FPS, calidad nativa cristalina (ultra-smooth)
     }
 }
 
@@ -843,6 +1611,7 @@ fn send_stream_feedback(
     summary: &StreamSummary,
     target_fps: u32,
     scale_divisor: u8,
+    echo_captured_at_ms: u64,
 ) -> Result<(), String> {
     let feedback = ControlFrame::new(
         ack.session_id.clone(),
@@ -851,6 +1620,7 @@ fn send_stream_feedback(
             scale_divisor,
             avg_latency_ms: summary.avg_latency_ms.round() as u32,
             jitter_ms: summary.jitter_ms.round() as u32,
+            echo_captured_at_ms,
         }],
     );
     let encoded =
@@ -862,6 +1632,9 @@ fn send_stream_feedback(
 }
 
 fn decode_stream_frame(frame: &StreamFrame) -> Result<Vec<u8>, String> {
+    if frame.tiles.is_some() {
+        return Ok(Vec::new());
+    }
     match frame.compression {
         StreamCompression::None => {
             if frame.compressed_payload_b64.is_empty() {
@@ -920,55 +1693,116 @@ fn generate_synthetic_bgra(frame: &StreamFrame) -> Vec<u8> {
     raw
 }
 
+struct UnicodeCollector {
+    chars: std::sync::Arc<std::sync::Mutex<Vec<char>>>,
+}
+
+impl minifb::InputCallback for UnicodeCollector {
+    fn add_char(&mut self, uni_char: u32) {
+        if let Some(c) = std::char::from_u32(uni_char) {
+            if let Ok(mut guard) = self.chars.lock() {
+                guard.push(c);
+            }
+        }
+    }
+}
+
 struct FrameRenderer {
     window: Window,
     width: usize,
     height: usize,
     buffer: Vec<u32>,
     last_compat_mode: Option<bool>,
+    is_fullscreen: bool,
+    stream_width: usize,
+    stream_height: usize,
+    char_buffer: std::sync::Arc<std::sync::Mutex<Vec<char>>>,
 }
 
 impl FrameRenderer {
-    fn try_new() -> Result<Self, String> {
-        let width = 1280;
-        let height = 720;
+    fn try_new(width: usize, height: usize) -> Result<Self, String> {
         let options = WindowOptions {
             resize: true,
             scale: Scale::X1,
+            scale_mode: minifb::ScaleMode::AspectRatioStretch,
             ..WindowOptions::default()
         };
         let mut window = Window::new("LanPilot Agent Stream", width, height, options)
             .map_err(|err| format!("create render window failed: {err}"))?;
         window.set_target_fps(60);
+
+        let char_buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        window.set_input_callback(Box::new(UnicodeCollector {
+            chars: std::sync::Arc::clone(&char_buffer),
+        }));
+
         Ok(Self {
             window,
             width,
             height,
             buffer: vec![0_u32; width * height],
             last_compat_mode: None,
+            is_fullscreen: false,
+            stream_width: width,
+            stream_height: height,
+            char_buffer,
         })
     }
 
+    fn toggle_fullscreen(&mut self) -> Result<(), String> {
+        self.is_fullscreen = !self.is_fullscreen;
+        
+        let (win_width, win_height) = if self.is_fullscreen {
+            #[cfg(windows)]
+            {
+                unsafe {
+                    let w = GetSystemMetrics(0); // SM_CXSCREEN = 0
+                    let h = GetSystemMetrics(1); // SM_CYSCREEN = 1
+                    if w > 0 && h > 0 {
+                        (w as usize, h as usize)
+                    } else {
+                        (self.stream_width, self.stream_height)
+                    }
+                }
+            }
+            #[cfg(not(windows))]
+            (self.stream_width, self.stream_height)
+        } else {
+            (self.stream_width, self.stream_height)
+        };
+        
+        let options = WindowOptions {
+            resize: !self.is_fullscreen,
+            scale: Scale::X1,
+            scale_mode: minifb::ScaleMode::AspectRatioStretch,
+            borderless: self.is_fullscreen,
+            topmost: self.is_fullscreen,
+            ..WindowOptions::default()
+        };
+        
+        let mut new_window = Window::new("LanPilot Agent Stream", win_width, win_height, options)
+            .map_err(|err| format!("create render window failed: {err}"))?;
+        new_window.set_target_fps(60);
+        
+        if let Some(compat) = self.last_compat_mode {
+            new_window.set_title(if compat {
+                "LanPilot Agent Stream — Modo compatibilidad"
+            } else {
+                "LanPilot Agent Stream — Captura real"
+            });
+        }
+        
+        self.window = new_window;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
     fn render(&mut self, frame: &StreamFrame, raw: &[u8], compat_mode: bool) -> Result<(), String> {
         let width = frame.width as usize;
         let height = frame.height as usize;
         let stride_bytes = frame.stride_bytes;
-        if stride_bytes < width * 4 {
-            return Err(format!(
-                "invalid stride {} (expected at least {})",
-                stride_bytes,
-                width * 4
-            ));
-        }
-        if raw.len() < stride_bytes * height {
-            return Err(format!(
-                "insufficient raw data {} for stride {} and height {}",
-                raw.len(),
-                stride_bytes,
-                height
-            ));
-        }
-
+        let is_rgb565 = frame.pixel_format == "rgb565";
+        
         if self.width != width || self.height != height {
             self.width = width;
             self.height = height;
@@ -983,14 +1817,96 @@ impl FrameRenderer {
             self.last_compat_mode = Some(compat_mode);
         }
 
-        for y in 0..height {
-            let row_start = y * stride_bytes;
-            for x in 0..width {
-                let idx = row_start + x * 4;
-                let b = raw[idx] as u32;
-                let g = raw[idx + 1] as u32;
-                let r = raw[idx + 2] as u32;
-                self.buffer[y * width + x] = (r << 16) | (g << 8) | b;
+        if let Some(ref tiles) = frame.tiles {
+            for tile in tiles {
+                let compressed = BASE64.decode(tile.compressed_payload_b64.as_bytes())
+                    .map_err(|err| format!("base64 decode tile failed: {err}"))?;
+                let decompressed = decompress_size_prepended(&compressed)
+                    .map_err(|err| format!("lz4 decompress tile failed: {err}"))?;
+                
+                let tile_row_stride = tile.width as usize * (if is_rgb565 { 2 } else { 4 });
+                for ty in 0..tile.height as usize {
+                    let gy = tile.y as usize + ty;
+                    if gy >= height { continue; }
+                    for tx in 0..tile.width as usize {
+                        let gx = tile.x as usize + tx;
+                        if gx >= width { continue; }
+                        
+                        if is_rgb565 {
+                            let idx = ty * tile_row_stride + tx * 2;
+                            if idx + 1 < decompressed.len() {
+                                let val = (decompressed[idx] as u16) | ((decompressed[idx + 1] as u16) << 8);
+                                let r5 = (val >> 11) & 0x1F;
+                                let g6 = (val >> 5) & 0x3F;
+                                let b5 = val & 0x1F;
+                                let r = ((r5 * 255) / 31) as u32;
+                                let g = ((g6 * 255) / 63) as u32;
+                                let b = ((b5 * 255) / 31) as u32;
+                                self.buffer[gy * width + gx] = (r << 16) | (g << 8) | b;
+                            }
+                        } else {
+                            let idx = ty * tile_row_stride + tx * 4;
+                            if idx + 2 < decompressed.len() {
+                                let b = decompressed[idx] as u32;
+                                let g = decompressed[idx + 1] as u32;
+                                let r = decompressed[idx + 2] as u32;
+                                self.buffer[gy * width + gx] = (r << 16) | (g << 8) | b;
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            let expected_stride = if is_rgb565 { width * 2 } else { width * 4 };
+            if stride_bytes < expected_stride {
+                return Err(format!(
+                    "invalid stride {} (expected at least {})",
+                    stride_bytes,
+                    expected_stride
+                ));
+            }
+            if raw.len() < stride_bytes * height {
+                return Err(format!(
+                    "insufficient raw data {} for stride {} and height {}",
+                    raw.len(),
+                    stride_bytes,
+                    height
+                ));
+            }
+
+            if is_rgb565 {
+                for y in 0..height {
+                    let row_start = y * stride_bytes;
+                    for x in 0..width {
+                        let idx = row_start + x * 2;
+                        let val = (raw[idx] as u16) | ((raw[idx + 1] as u16) << 8);
+                        let r5 = (val >> 11) & 0x1F;
+                        let g6 = (val >> 5) & 0x3F;
+                        let b5 = val & 0x1F;
+                        let r = ((r5 * 255) / 31) as u32;
+                        let g = ((g6 * 255) / 63) as u32;
+                        let b = ((b5 * 255) / 31) as u32;
+                        self.buffer[y * width + x] = (r << 16) | (g << 8) | b;
+                    }
+                }
+            } else {
+                if stride_bytes == width * 4 {
+                    unsafe {
+                        let src_u32 = std::slice::from_raw_parts(raw.as_ptr() as *const u32, width * height);
+                        self.buffer.copy_from_slice(src_u32);
+                    }
+                } else {
+                    for y in 0..height {
+                        let row_start = y * stride_bytes;
+                        for x in 0..width {
+                            let idx = row_start + x * 4;
+                            let b = raw[idx] as u32;
+                            let g = raw[idx + 1] as u32;
+                            let r = raw[idx + 2] as u32;
+                            self.buffer[y * width + x] = (r << 16) | (g << 8) | b;
+                        }
+                    }
+                }
             }
         }
 
@@ -999,6 +1915,7 @@ impl FrameRenderer {
             .map_err(|err| format!("render update failed: {err}"))
     }
 
+    #[allow(dead_code)]
     fn is_open(&self) -> bool {
         self.window.is_open()
     }
@@ -1093,6 +2010,275 @@ struct StreamSummary {
     fps: f64,
     avg_latency_ms: f64,
     jitter_ms: f64,
+}
+
+fn spawn_audio_client(host_ipv4: String, stop: StopFlag, logger: Logger) {
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    use std::net::TcpStream;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use std::collections::VecDeque;
+
+    std::thread::spawn(move || {
+        let endpoint = format!("{}:{}", host_ipv4, AUDIO_PORT);
+        logger.log(format!("Conectando al stream de audio en {}...", endpoint));
+        
+        let mut stream = match TcpStream::connect(&endpoint) {
+            Ok(s) => {
+                let _ = s.set_nodelay(true);
+                s
+            }
+            Err(e) => {
+                logger.log(format!("Aviso: no se pudo conectar al servidor de audio: {e}"));
+                return;
+            }
+        };
+        
+        let mut header = [0u8; 8];
+        if let Err(e) = std::io::Read::read_exact(&mut stream, &mut header) {
+            logger.log(format!("Aviso: error al leer cabecera de audio: {e}"));
+            return;
+        }
+        
+        let sample_rate = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+        let channels = u16::from_le_bytes([header[4], header[5]]);
+        let use_compression = u16::from_le_bytes([header[6], header[7]]) == 1;
+        
+        logger.log(format!(
+            "Stream de audio inicializado: {} Hz, {} canales (PCM 16-bit, compression={})",
+            sample_rate, channels, use_compression
+        ));
+        
+        #[cfg(windows)]
+        unsafe {
+            #[link(name = "ole32")]
+            unsafe extern "system" {
+                fn CoInitializeEx(pv_reserved: *mut std::ffi::c_void, dw_co_init: u32) -> i32;
+            }
+            let _ = CoInitializeEx(std::ptr::null_mut(), 0x2);
+        }
+        
+        let host = cpal::default_host();
+        let device = match host.default_output_device() {
+            Some(d) => d,
+            None => {
+                logger.log("Aviso: no se encontró dispositivo de salida de audio".to_string());
+                return;
+            }
+        };
+        
+        let output_config = match device.default_output_config() {
+            Ok(c) => c,
+            Err(e) => {
+                logger.log(format!("Aviso: no se pudo obtener la configuración de salida de audio: {e}"));
+                return;
+            }
+        };
+        let agent_config: cpal::StreamConfig = output_config.clone().into();
+        let agent_sample_rate = agent_config.sample_rate.0 as f64;
+        let agent_channels = agent_config.channels as usize;
+        
+        let host_sample_rate = sample_rate as f64;
+        let host_channels = channels as usize;
+        
+        logger.log(format!(
+            "Tarjeta local de audio: {} Hz, {} canales",
+            agent_config.sample_rate.0, agent_config.channels
+        ));
+        
+        let audio_buffer = Arc::new(Mutex::new(VecDeque::<i16>::new()));
+        let play_buffer = Arc::clone(&audio_buffer);
+        
+        // Estado del resampler lineal y Jitter Buffer adaptativo
+        let mut last_frame = vec![0.0f32; host_channels];
+        let mut next_frame = vec![0.0f32; host_channels];
+        let mut phase = 0.0f64;
+        let base_factor = host_sample_rate / agent_sample_rate;
+        let target_latency_samples = (host_sample_rate * host_channels as f64 * 0.08) as usize; // 80ms target
+        let threshold = (host_sample_rate * host_channels as f64 * 0.02) as usize; // 20ms threshold
+        let mut fade_volume = 1.0f32;
+        
+        let cpal_stream = match device.build_output_stream(
+            &agent_config,
+            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                let mut buffer = play_buffer.lock().unwrap();
+                let current_len = buffer.len();
+                
+                // Modular la velocidad de resampler para sincronizar la latencia
+                let speed_multiplier = if current_len > target_latency_samples + threshold {
+                    1.02f64 // Consumir buffer un 2% más rápido
+                } else if current_len > 0 && current_len < target_latency_samples.saturating_sub(threshold) {
+                    0.98f64 // Estirar el buffer un 2% más lento
+                } else {
+                    1.00f64
+                };
+                let current_factor = base_factor * speed_multiplier;
+                
+                for frame in data.chunks_exact_mut(agent_channels) {
+                    while phase >= 1.0 {
+                        last_frame.copy_from_slice(&next_frame);
+                        if buffer.len() >= host_channels {
+                            for i in 0..host_channels {
+                                if let Some(s) = buffer.pop_front() {
+                                    next_frame[i] = (s as f32) / 32768.0;
+                                }
+                            }
+                            phase -= 1.0;
+                            fade_volume = (fade_volume + 0.05).min(1.0);
+                        } else {
+                            fade_volume = (fade_volume - 0.02).max(0.0);
+                            if fade_volume == 0.0 {
+                                next_frame.fill(0.0);
+                                phase = 0.0;
+                                break;
+                            } else {
+                                for i in 0..host_channels {
+                                    next_frame[i] = next_frame[i] * fade_volume;
+                                }
+                                phase -= 1.0;
+                            }
+                        }
+                    }
+                    
+                    let t = phase as f32;
+                    let interpolated_channel = |ch: usize| -> f32 {
+                        if ch < host_channels {
+                            ((1.0 - t) * last_frame[ch] + t * next_frame[ch]) * fade_volume
+                        } else {
+                            0.0
+                        }
+                    };
+                    
+                    for i in 0..agent_channels {
+                        if host_channels == 1 {
+                            frame[i] = interpolated_channel(0);
+                        } else if host_channels == 2 && agent_channels == 1 {
+                            frame[i] = (interpolated_channel(0) + interpolated_channel(1)) * 0.5;
+                        } else if host_channels == 2 && agent_channels > 2 {
+                            if i % 2 == 0 {
+                                frame[i] = interpolated_channel(0);
+                            } else {
+                                frame[i] = interpolated_channel(1);
+                            }
+                        } else {
+                            frame[i] = interpolated_channel(i);
+                        }
+                    }
+                    
+                    phase += current_factor;
+                }
+            },
+            |err| eprintln!("an error occurred on stream: {}", err),
+            None
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                logger.log(format!("Aviso: no se pudo crear el stream de salida de audio: {e}"));
+                return;
+            }
+        };
+        
+        if let Err(e) = cpal_stream.play() {
+            logger.log(format!("Aviso: no se pudo iniciar la reproducción de audio: {e}"));
+            return;
+        }
+        
+        let mut temp_buf = [0u8; 4096];
+        let mut predictor = 0;
+        let mut step_index = 0;
+
+        if use_compression {
+            let _ = stream.set_nonblocking(false);
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
+            
+            let mut len_bytes = [0u8; 4];
+            while !is_stopped(&stop) {
+                if let Err(e) = std::io::Read::read_exact(&mut stream, &mut len_bytes) {
+                    if e.kind() == std::io::ErrorKind::TimedOut || e.kind() == std::io::ErrorKind::WouldBlock {
+                        continue;
+                    }
+                    logger.log("Desconexión en stream de audio comprimido.".to_string());
+                    break;
+                }
+                let compressed_len = u32::from_le_bytes(len_bytes) as usize;
+                let mut compressed_data = vec![0u8; compressed_len];
+                if let Err(e) = std::io::Read::read_exact(&mut stream, &mut compressed_data) {
+                    logger.log(format!("Error leyendo payload de audio comprimido: {e}"));
+                    break;
+                }
+                
+                if let Ok(decompressed) = decompress_size_prepended(&compressed_data) {
+                    let mut buffer = audio_buffer.lock().unwrap();
+                    for byte in decompressed {
+                        let code1 = byte & 0x0F;
+                        let code2 = (byte >> 4) & 0x0F;
+                        let s1 = lanpilot_core::adpcm_decode_sample(code1, &mut predictor, &mut step_index);
+                        let s2 = lanpilot_core::adpcm_decode_sample(code2, &mut predictor, &mut step_index);
+                        buffer.push_back(s1);
+                        buffer.push_back(s2);
+                    }
+                    
+                    let max_latency_samples = (sample_rate as usize * channels as usize) / 4;
+                    if buffer.len() > max_latency_samples {
+                        let discard = buffer.len() - (max_latency_samples / 2);
+                        buffer.drain(0..discard);
+                        
+                        let fade_len = ((sample_rate as usize * 5 / 1000) * channels as usize).min(buffer.len());
+                        for i in 0..fade_len {
+                            let factor = i as f32 / fade_len as f32;
+                            buffer[i] = (buffer[i] as f32 * factor) as i16;
+                        }
+                    }
+                }
+            }
+        } else {
+            let _ = stream.set_nonblocking(true);
+            while !is_stopped(&stop) {
+                match std::io::Read::read(&mut stream, &mut temp_buf) {
+                    Ok(0) => {
+                        logger.log("Stream de audio cerrado por el host.".to_string());
+                        break;
+                    }
+                    Ok(n) => {
+                        let mut buffer = audio_buffer.lock().unwrap();
+                        let bytes = &temp_buf[0..n];
+                        
+                        for &byte in bytes {
+                            let code1 = byte & 0x0F;
+                            let code2 = (byte >> 4) & 0x0F;
+                            
+                            let s1 = lanpilot_core::adpcm_decode_sample(code1, &mut predictor, &mut step_index);
+                            let s2 = lanpilot_core::adpcm_decode_sample(code2, &mut predictor, &mut step_index);
+                            
+                            buffer.push_back(s1);
+                            buffer.push_back(s2);
+                        }
+                        
+                        let max_latency_samples = (sample_rate as usize * channels as usize) / 4;
+                        if buffer.len() > max_latency_samples {
+                            let discard = buffer.len() - (max_latency_samples / 2);
+                            buffer.drain(0..discard);
+                            
+                            let fade_len = ((sample_rate as usize * 5 / 1000) * channels as usize).min(buffer.len());
+                            for i in 0..fade_len {
+                                let factor = i as f32 / fade_len as f32;
+                                buffer[i] = (buffer[i] as f32 * factor) as i16;
+                            }
+                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => {
+                        logger.log(format!("Error de lectura en stream de audio: {e}"));
+                        break;
+                    }
+                }
+            }
+        }
+        
+        let _ = cpal_stream.pause();
+    });
 }
 
 #[cfg(test)]
@@ -1268,4 +2454,12 @@ mod tests {
         }
         assert!(!is_mostly_black_frame(&raw, stride, width, height));
     }
+}
+
+#[cfg(windows)]
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn GetSystemMetrics(n_index: i32) -> i32;
+    fn GetKeyState(n_virt_key: i32) -> i16;
+    fn SetCursorPos(x: i32, y: i32) -> i32;
 }

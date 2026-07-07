@@ -27,7 +27,7 @@ try {
     }
     New-Item -ItemType Directory -Path $portableRoot -Force | Out-Null
 
-    Copy-Item (Join-Path $targetRelease 'lanpilot-app.exe') (Join-Path $portableRoot 'LanPilot.exe')
+    Copy-Item (Join-Path $targetRelease 'LanPilot.exe') (Join-Path $portableRoot 'LanPilot.exe')
 
     @'
 LanPilot Portable
@@ -51,7 +51,23 @@ Este paquete ya es un EXE unico real:
         Remove-Item $checksumPath -Force
     }
     Compress-Archive -Path (Join-Path $portableRoot '*') -DestinationPath $zipPath -Force
-    Copy-Item (Join-Path $portableRoot 'LanPilot.exe') $desktopExePath -Force
+    try {
+        if (Test-Path $desktopExePath) {
+            # Si el archivo está en ejecución o bloqueado por Windows UAC,
+            # lo renombramos a .old para poder colocar el nuevo binario en su lugar.
+            $oldPath = "$desktopExePath.old"
+            if (Test-Path $oldPath) {
+                Remove-Item -Path $oldPath -Force -ErrorAction SilentlyContinue
+            }
+            Rename-Item -Path $desktopExePath -NewName (Split-Path $oldPath -Leaf) -Force -ErrorAction SilentlyContinue
+        }
+        Copy-Item (Join-Path $portableRoot 'LanPilot.exe') $desktopExePath -Force
+        if (Test-Path "$desktopExePath.old") {
+            Remove-Item -Path "$desktopExePath.old" -Force -ErrorAction SilentlyContinue
+        }
+    } catch {
+        Write-Warning "No se pudo copiar el binario al Escritorio: $_"
+    }
 
     $exeHash = (Get-FileHash -Path (Join-Path $portableRoot 'LanPilot.exe') -Algorithm SHA256).Hash
     $zipHash = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash
