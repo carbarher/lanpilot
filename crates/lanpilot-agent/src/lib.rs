@@ -1483,7 +1483,8 @@ fn run_phase3_stream_channel(
         last_captured_at_ms = frame.captured_at_ms as u64;
         let compat_mode = frame.source.eq_ignore_ascii_case("synthetic");
         let raw = decode_stream_frame(&frame)?;
-        if is_mostly_black_frame(&raw, frame.stride_bytes, frame.width as usize, frame.height as usize) {
+        let is_rgb565 = frame.pixel_format == "rgb565";
+        if is_mostly_black_frame(&raw, frame.stride_bytes, frame.width as usize, frame.height as usize, is_rgb565) {
             black_filtered += 1;
             if !black_filter_logged {
                 logger.log("Pantalla negra detectada: ocultando frames sin imagen.".to_string());
@@ -2137,8 +2138,9 @@ impl FrameRenderer {
     }
 }
 
-fn is_mostly_black_frame(raw: &[u8], stride_bytes: usize, width: usize, height: usize) -> bool {
-    if width == 0 || height == 0 || stride_bytes < width * 4 {
+fn is_mostly_black_frame(raw: &[u8], stride_bytes: usize, width: usize, height: usize, is_rgb565: bool) -> bool {
+    let bpp = if is_rgb565 { 2 } else { 4 };
+    if width == 0 || height == 0 || stride_bytes < width * bpp {
         return false;
     }
 
@@ -2150,13 +2152,22 @@ fn is_mostly_black_frame(raw: &[u8], stride_bytes: usize, width: usize, height: 
     for y in (0..height).step_by(step_y) {
         let row_start = y * stride_bytes;
         for x in (0..width).step_by(step_x) {
-            let idx = row_start + x * 4;
-            if idx + 2 >= raw.len() {
+            let idx = row_start + x * bpp;
+            if idx + bpp > raw.len() {
                 return false;
             }
-            let b = raw[idx] as u16;
-            let g = raw[idx + 1] as u16;
-            let r = raw[idx + 2] as u16;
+            let (r, g, b) = if is_rgb565 {
+                let pixel = u16::from_le_bytes([raw[idx], raw[idx + 1]]);
+                let r_val = (((pixel >> 11) & 0x1F) << 3) as u16;
+                let g_val = (((pixel >> 5) & 0x3F) << 2) as u16;
+                let b_val = ((pixel & 0x1F) << 3) as u16;
+                (r_val, g_val, b_val)
+            } else {
+                let b_val = raw[idx] as u16;
+                let g_val = raw[idx + 1] as u16;
+                let r_val = raw[idx + 2] as u16;
+                (r_val, g_val, b_val)
+            };
             let brightness = (r + g + b) / 3;
             if brightness <= 8 {
                 dark += 1;
@@ -2593,7 +2604,7 @@ mod tests {
         let height = 32usize;
         let stride = width * 4;
         let raw = vec![0_u8; stride * height];
-        assert!(is_mostly_black_frame(&raw, stride, width, height));
+        assert!(is_mostly_black_frame(&raw, stride, width, height, false));
     }
 
     #[test]
@@ -2611,7 +2622,7 @@ mod tests {
                 raw[idx + 3] = 255;
             }
         }
-        assert!(!is_mostly_black_frame(&raw, stride, width, height));
+        assert!(!is_mostly_black_frame(&raw, stride, width, height, false));
     }
 }
 
