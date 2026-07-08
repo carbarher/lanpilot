@@ -1081,7 +1081,24 @@ fn handle_control_stream(
                     let win_active = GetKeyState(0x5B) < 0 || GetKeyState(0x5C) < 0;
                     let any_modifier = ctrl_active || alt_active || win_active;
                     
-                    let is_normal_printable_key = key.len() == 1 || key.starts_with("Key") || key.starts_with("NumPad");
+                    let is_symbol_key = matches!(
+                        key.as_str(),
+                        "Backslash"
+                            | "Slash"
+                            | "Minus"
+                            | "Equal"
+                            | "LeftBrace"
+                            | "RightBrace"
+                            | "Semicolon"
+                            | "Apostrophe"
+                            | "Comma"
+                            | "Period"
+                            | "Backquote"
+                    );
+                    let is_normal_printable_key = key.len() == 1
+                        || key.starts_with("Key")
+                        || key.starts_with("NumPad")
+                        || is_symbol_key;
                     
                     if !is_normal_printable_key || any_modifier {
                         if let Some(vk) = map_key_to_vk(key) {
